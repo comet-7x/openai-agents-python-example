@@ -24,7 +24,7 @@ uv run main.py --interactive
 The orchestrator agent is the primary chat agent equipped with a `Session` memory, subagents-as-tools, a skills subsystem and Subagent pool subsystem. 
 
 ### Subagent Pool
-The orchestrator owns a pool of subagents, running as asyncio tasks to allow the orchestrator to delegate messages. The Pool enforces a strict GPU limit to ensure the orchestrator does not explode GPU budget on unproven tasks. Individual GPU type limits are configurable.
+The orchestrator owns a pool of subagents, running as asyncio tasks to allow the orchestrator to delegate messages without blocking. The Pool enforces a strict GPU limit to ensure the orchestrator does not explode GPU budget on unproven tasks. Individual GPU type limits are configurable.
 
 ### Subagents
 The subagents are your "coding agents" with shell and file tools. They are implemented as tools to the orchestrator agent, allowing implementation details for each experiment to accumulate in the subagent and not bloat the orchestrator's context window. 
