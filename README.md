@@ -11,7 +11,7 @@ To run it with a one-shot task:
 uv run main.py --prompt "Start working on the parameter golf challenge. First pull the repo, exploring past approaches, and create a working environment. Then create a plan for five parallel approaches that could be done, and guide those experiments through to completion, reporting their performance back."
 ```
 
-This should trigger the loading of the (parameter_golf.md)[/skills/parameter_golf.md] skill, and kick off parallel experiments.
+This should trigger the loading of the [parameter_golf.md](skills/parameter_golf.md) skill, and kick off parallel experiments.
 
 The harness can also be run as an interactive chat with:
 ```bash
