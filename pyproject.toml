@@ -1,0 +1,11 @@
+[project]
+name = "oai-agents-example"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "openai-agents[modal]",
+    "rich>=13.1.0,<15",
+]
+
+[tool.uv.sources]
+openai-agents = { path = "../openai-agents-python-preview", editable = true }
