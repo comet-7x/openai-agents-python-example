@@ -203,6 +203,8 @@ class OrchestratorAgent:
 async def invoke_subagent(self, agent_id: str, prompt: str) -> str:
     """Start a task on a subagent and return immediately (non-blocking)."""
     entry = self._pool.get(agent_id)
+
+    # .task is now a Future handle to the async result
     entry.task = asyncio.create_task(Runner.run(
         entry.agent, prompt,
         session=entry.conv_session,
@@ -225,19 +227,67 @@ async def wait_for_first_subagent_result(self) -> str:
     return f"Subagent '{entry.id}' ({entry.name}) completed: {result.final_output}"
 ```
 
-.. 
+Now that the orchestrator doesn't block waiting for results, we need ways for it to poll for task status.
 
-    - issue to overcome: now how to keep orchestrator running?
-        - future work includes self-thought tool
-    - adding tools to monitor async jobs + display
-    - adding `Hooks` to track active tool, 
-- And a GPU quota system!
-- Parallel MNIST
-- Issue: all my parallel agents are doing the same setup!
-    - If you know reqs in advance you could use `modal.Image` but since we're general purpose, we need to let the AGENT interractively build out an image
-    - We add `Filesystem Snapshots` to freeze a current subagent's sandbox filesystem into an image we could boot from later
-        - This is implemented as an orchestrator tool, allowing it to branch work
-        - Add-on benefit: context management. Even using subagents, long tasks in a sandbox can suffer from context rot and degrade over long runs. A stateful filesystem allows an agent to offload its progress to the disk, clear its session memory, and allow the next agent to quickly opt back in to this context using its file tools. This on-disk memory can either be explicit via writing skills/memory files, or implicit by starting in an already-working codebase. 
-            - The orchestrator can stage work, snapshot, and then drop fresh agents back into that snapshot with basic follow-up instructions and that subagent will quickly be able to get its bearings and resume work without the bloat of the context window that'd gotten the image to this point.
-- Adding skills subsystem to pull it all together
-- Parallel code golf!
+We implement this in two ways, using `Hooks` to track the current active tool for each subagent, and adding a `set_status` tool for the subagent to periodically update its status without fully exiting back to the orchestrator.
+
+```python
+TODO - code for Hooks and set_status
+```
+
+It took a great deal of "encouragement" (TODO link prompt) to keep the orchestrator from exiting before its async tasks. Future work, as an exercise for the reader, could included implementing a special "self thought" tool or subagent to give the orchestrator a productive outlet for thinking/planning rather than waiting for subagent results.
+
+### Limiting GPU spend with quotas
+
+With async tasks, we're handing LLMs the potentially expensive ability to spin up unbounded amounts of GPU subagents. We can simply add a quota system to the subagent pool to ensure a fixed limit of expensive 8x H100s are in use.
+
+```
+TODO: code for gpu quota pool
+```
+
+### Now we can parallel train MNIST 
+.. now that the orchestrator can manage parallel work, let's try parallelizing mnist across different backends with a prompt like:
+```bash
+uv run main.py --prompt "Implement and train a model on the MNIST using pytorch, tensorflow, and jax"
+```
+
+
+
+### Using Filesystem Snapshots to deduplicate work
+
+At this point we can also dump context for `Parameter Golf` into the prompt, though you'll quickly see our next challenge: the subagents all waste precious GPU time doing the same setup work - pulling the repo and installing dependencies.
+
+Over longer-horizon tasks, you can imagine all sorts of "checkpoint" moments where you'd want to store the sandbox state to allow future fresh subagents to start from that point.
+
+We add `Filesystem Snapshots` to freeze an active sandbo session into an ID, which the orchestrator may later refer too as a starting image for a new subagent, allowing it to branch work from known checkpoints.
+
+```python
+CODE for snapshot tool and registry
+```
+
+Beyond saving time, the add-on benefit of filesystem snapshots goes back to our topic of `context management`. Beyond using `Sessions` to store context window state, the filesystem of a live sandbox, when viewed via a shell too, is also implicitly a form of memory. A stateful filesystem allows the artifacts produced by a prior agent be available to all future agents, even if the future agents don't have it explicitly put into their context `Sessions`. This on-disk memory can either be implemented explicitly, via writing skills/memory files, or implicitly by the nature of the codebase already having been put in a working state.
+
+Now, the orchestrator can progress threads of work, snapshot that filesystem, and then drop fresh subagents into that snapshot with basic follow-up instructions and the subagent will quickly be able to get its bearings and resume work, without the context bloat of the work that led to this point.
+
+### Adding a skills subsystem
+
+Or final step for running `Parameter Golf` efficiently is prompting!
+
+Currently it takes extensive prompting to get the orchestrator to use its async research tools effectively, and to understand the specific `Parameter Golf` challenge we're giving it. We could add those prompts into the core harness, but to keep the harness general purpose we instead give the orchestrator tools to selectively opt-into this context via a list of `Skills` plugins.
+
+
+```python
+CODE for skill list and load
+```
+
+
+## We've now built parallel auto-research on GPUs!
+
+We've started with a basic, locally-executing agent loop. Secured it with remote sandboxes. Scaled it with async workers. And given it pluggable skills to run `Parameter Golf` research, in parallel, autonomously.
+
+Run it with:
+```bash
+uv run main.py --prompt "Prepare a Parameter Golf experiment environment, generate a plan for five parallel experiments to run, and run those experiements. Report back your findings, including final training loss and score."
+```
+
+If there's anything to take away from this blog, it's the understanding that you can *compose* systems on top of your base agent loops to suit it for your task. In our case, we built an harness that keeps context lean for an orchestrator, and takes full advantage of the parallelism of Modal's sandbox platform. All of this has been made incredibly simple and composable thanks to the OpenAI Agent SDK. It's been a blast to build with and we hope you take this project as an inspiration to build your own thing!
