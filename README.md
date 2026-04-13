@@ -1,5 +1,5 @@
 # Parallel GPU Coding Agents
-This repo is an example of using OpenAI Agents SDK and Modal Sandboxes to implement general purpose coding agent harness with async workers. 
+This repo is an example of using OpenAI Agents SDK and Modal Sandboxes to implement a general purpose coding agent harness with async workers. 
 
 ### Example: Parameter Golf
 While implemented to be general-purpose, the `/skills` markdown plugin system allows agents to opt-in to guides and context to improve their performance.

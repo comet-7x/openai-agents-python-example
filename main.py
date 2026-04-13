@@ -5,7 +5,6 @@ import uuid
 from agents.extensions.sandbox.modal import ModalSandboxClient, ModalSandboxClientOptions
 
 from orchestrator import OrchestratorAgent
-from orchestrator import OrchestratorHooks
 
 async def main(prompt: str | None, interactive: bool = False):
     trace_id = "trace_" + str(uuid.uuid4())
