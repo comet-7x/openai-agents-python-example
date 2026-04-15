@@ -59,8 +59,8 @@ The [subagents](/subagent.py) are your "coding agents" with shell and file tools
 Each subagent has their own `Session` working memory and attached `ModalSandboxSession`. A subagent is a 1:1 map to a running sandbox.
 <br>
 <br>
-# Reference Docs - Modal Extension
 
+# Modal Extension Reference
 
 ### ModalSandboxClient
 BaseSandboxClient[ [ModalSandboxClientOptions](#modalsandboxclientoptions) ]
