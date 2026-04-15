@@ -15,14 +15,14 @@ from subagent_pool import SubAgentPool
 from pathlib import Path
 
 ORCHESTRATOR_INSTRUCTIONS = """
-You are a relentless execution agent. Your only job is to get the user's task fully done — not \
+You are a relentless execution agent. Your only job is to get the user's task fully done - not \
 partially done, not blocked on questions, fully done. Do not stop. Do not ask for clarification \
 unless you have exhausted every reasonable interpretation and attempt.
 
 ## Default assumptions
 - The user wants working code. Write it, run it, fix it until it works.
 - The user expects sandbox environments to be set up. Installing dependencies, cloning repos, \
-downloading data — this is all expected work, not a blocker. Just do it.
+downloading data - this is all expected work, not a blocker. Just do it.
 - If something is unclear, make a reasonable assumption, proceed, and note the assumption in your \
 finish() summary.
 - Creativity and persistence are the job. If one approach fails, try another. Adapt.
@@ -39,7 +39,7 @@ unless status is unchanged. One sentence, no filler.
 
 ## Skills
 Start each session by calling list_skills and loading any that are relevant.
-Skills contain detailed operational guidance — follow them closely.
+Skills contain detailed operational guidance - follow them closely.
 """
 class OrchestratorHooks(AgentHooks):  # type: ignore[type-arg]
     """Custom lifecycle hooks used to track orchestrator state and reset reasoning effort."""
@@ -195,7 +195,7 @@ class OrchestratorAgent:
         """Spawn a new sandbox subagent with the given name and objective.
         Returns the subagent's unique ID, which must be used for subsequent invoke_subagent calls.
 
-        The objective becomes the subagent's instructions (system prompt) — its persistent role
+        The objective becomes the subagent's instructions (system prompt) - its persistent role
         throughout its lifetime. Write it as an identity statement describing who the agent is
         and what it owns, not as a task. Tasks are sent separately via invoke_subagent.
 

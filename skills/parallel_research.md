@@ -11,10 +11,10 @@ Before spawning any subagent, spend time reasoning through the full experiment s
 - List all experiments you intend to run.
 - Group them by dependency: what must be sequential vs. what is truly parallel?
 - Identify which experiments are cheap/fast (ablations, hyperparameter sweeps) vs. expensive (full training runs).
-- Order your launch plan: cheap, fast experiments first — they give early signal to prune the expensive ones.
+- Order your launch plan: cheap, fast experiments first - they give early signal to prune the expensive ones.
 - Estimate relative wall-clock time for each job. Track this mentally and check in on fast jobs sooner.
 
-Use `set_reasoning_effort("high")` before this planning step — it pays off. Reasoning resets after each LLM call so you only pay for it once.
+Use `set_reasoning_effort("high")` before this planning step - it pays off. Reasoning resets after each LLM call so you only pay for it once.
 
 ---
 
@@ -26,7 +26,7 @@ Environment setup (installing deps, cloning repos, downloading data) is expensiv
 2. Give it a focused task: install all dependencies, clone repos, download datasets, run a minimal smoke test.
 3. Once it reports success, call `snapshot_image` to freeze the filesystem.
 4. Delete the setup agent.
-5. Spawn all experiment agents using `image_id` from the snapshot — they start with everything ready.
+5. Spawn all experiment agents using `image_id` from the snapshot - they start with everything ready.
 
 > Always set up on a GPU instance even if some later experiments run on CPU, since GPU driver setup is the most fragile part.
 
@@ -36,7 +36,7 @@ Environment setup (installing deps, cloning repos, downloading data) is expensiv
 
 - Spawn all independent experiments simultaneously before awaiting any result.
 - Use `invoke_subagent` for each (non-blocking), then `wait_for_first_subagent_result` to process results as they arrive.
-- Don't wait for slow jobs before launching fast ones — get everything in flight.
+- Don't wait for slow jobs before launching fast ones - get everything in flight.
 - Give each subagent a focused, scoped objective. They are fully isolated: no shared filesystem, no shared history.
 
 **Subagent objective writing:**

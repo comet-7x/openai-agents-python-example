@@ -29,8 +29,8 @@ class LiveDisplay:
 
     def _render_orchestrator(self) -> Panel:
         orch = self._orchestrator
-        reasoning = orch._reasoning_effort or "—"
-        tool = orch.current_tool or "—"
+        reasoning = orch._reasoning_effort or "-"
+        tool = orch.current_tool or "-"
         turns = orch.turns
 
         spinner = _SPINNER_FRAMES[self._frame % len(_SPINNER_FRAMES)] if orch.is_thinking else " "
@@ -91,7 +91,7 @@ class LiveDisplay:
             )
 
         count = len(entries)
-        title = f"Subagents — {count} active" if count else "Subagents — idle"
+        title = f"Subagents - {count} active" if count else "Subagents - idle"
         return Panel(table, title=title, border_style="dim")
 
     def _render(self) -> Group:

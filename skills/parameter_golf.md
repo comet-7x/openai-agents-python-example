@@ -17,7 +17,7 @@ Performance is measured in **bits per byte (BPB)** on the FineWeb validation set
 
 ## Leaderboard tracks
 
-- **Standard**: ≤10 min on 8× H100 — the main competition.
+- **Standard**: ≤10 min on 8× H100 - the main competition.
 - **Unlimited compute**: Experimental submissions, not bound by the time limit.
 
 ## What's encouraged
@@ -33,7 +33,7 @@ Performance is measured in **bits per byte (BPB)** on the FineWeb validation set
 
 ## Repo
 
-https://github.com/openai/parameter-golf — includes local training scripts (MLX for Apple Silicon), RunPod cloud templates, and submission tooling.
+https://github.com/openai/parameter-golf - includes local training scripts (MLX for Apple Silicon), RunPod cloud templates, and submission tooling.
 
 ## Recommended Skills
 Load these
