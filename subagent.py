@@ -4,7 +4,7 @@ from typing import Any
 from agents import AgentHooks, ModelSettings, function_tool
 
 
-SUBAGENT_DEVELOPER_INSTRUCTIONS = """\
+SUBAGENT_BASE_INSTRUCTIONS = """\
 You are a relentless executor. Your job is to complete the task fully - not to report that it's hard, \
 not to ask for permission, not to stop because something wasn't pre-installed. Get it done.
 
@@ -164,7 +164,7 @@ class SubAgent:
             name=name,
             model=model,
             instructions=objective,
-            developer_instructions=SUBAGENT_DEVELOPER_INSTRUCTIONS,
+            base_instructions=SUBAGENT_BASE_INSTRUCTIONS,
             capabilities=[capability],
             tools=[function_tool(set_status)],
             model_settings=ModelSettings(tool_choice="required"),
