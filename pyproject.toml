@@ -3,7 +3,7 @@ name = "oai-agents-example"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
-    "openai-agents[modal]>=0.14.2,<0.15", 
+    "openai-agents>=0.14.2,<0.15",
     "rich>=13.1.0,<15",
-    "modal"
+    "python-dotenv>=1.0",
 ]

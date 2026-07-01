@@ -1,18 +1,62 @@
 import asyncio
-from typing import Any
+import json
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal
 
-from typing import Literal
-
-from agents import AgentHooks, ModelSettings, StopAtTools, function_tool
-from agents.extensions.sandbox.modal import ModalSandboxClient, ModalSandboxClientOptions
+from agents import (
+    Agent,
+    AgentHooks,
+    ItemHelpers,
+    ModelSettings,
+    OpenAIChatCompletionsModel,
+    RawResponsesStreamEvent,
+    RunItemStreamEvent,
+    StopAtTools,
+    function_tool,
+)
+from agents.items import (
+    MessageOutputItem,
+    ReasoningItem,
+    ToolCallItem,
+    ToolCallOutputItem,
+)
 from agents.memory import SQLiteSession
-from agents.run import Agent, Runner, RunConfig
-from openai.types.shared import Reasoning, ReasoningEffort
+from agents.run import Runner
+from openai.types.responses import (
+    ResponseReasoningTextDeltaEvent,
+    ResponseTextDeltaEvent,
+)
 
 from display import LiveDisplay
 from subagent_pool import SubAgentPool
 
-from pathlib import Path
+
+@dataclass
+class StreamChunk:
+    """A single streamed event from the orchestrator.
+
+    type values:
+      "text"          — final-answer token delta (streamed, use to print in real time)
+      "thinking"      — reasoning token delta (streamed; only fires on reasoning models)
+      "tool_call"     — orchestrator called a tool (complete, not delta)
+      "tool_output"   — tool returned a result (complete)
+      "thinking_done" — full reasoning block finished (content = complete reasoning text)
+      "message_done"  — the orchestrator's current message is complete
+
+    "thinking" / "thinking_done" are emitted when the model supports reasoning
+    (e.g. o1, o3). They are safe to ignore or use as a flag / debug trace.
+    """
+
+    content: str
+    type: Literal[
+        "text", "thinking", "tool_call", "tool_output", "thinking_done", "message_done"
+    ] = "text"
+    tool_name: str | None = field(default=None)
+    tool_args: dict[str, Any] | None = field(default=None)
+    tool_call_id: str | None = field(default=None)
+
 
 ORCHESTRATOR_INSTRUCTIONS = """
 You are a relentless execution agent. Your only job is to get the user's task fully done - not \
@@ -21,7 +65,7 @@ unless you have exhausted every reasonable interpretation and attempt.
 
 ## Default assumptions
 - The user wants working code. Write it, run it, fix it until it works.
-- The user expects sandbox environments to be set up. Installing dependencies, cloning repos, \
+- Subagents have access to a local shell. Installing dependencies, cloning repos, \
 downloading data - this is all expected work, not a blocker. Just do it.
 - If something is unclear, make a reasonable assumption, proceed, and note the assumption in your \
 finish() summary.
@@ -30,8 +74,7 @@ finish() summary.
 ## Subagent instructions
 Write your subagent objectives and task messages with the same mindset: assume the work is expected, \
 assume setup is needed, and instruct them to persist. Never let a subagent stop just because something \
-wasn't pre-installed or pre-configured. Subagents should be told to figure it out. \
-Turn on high reasoning if subagents are particularly stuck.
+wasn't pre-installed or pre-configured. Subagents should be told to figure it out.
 
 ## Status updates
 Before every tool call, call set_status with a one-sentence description of what you are about to do, \
@@ -41,54 +84,44 @@ unless status is unchanged. One sentence, no filler.
 Start each session by calling list_skills and loading any that are relevant.
 Skills contain detailed operational guidance - follow them closely.
 """
+
+
 class OrchestratorHooks(AgentHooks):  # type: ignore[type-arg]
-    """Custom lifecycle hooks used to track orchestrator state and reset reasoning effort."""
+    """Lifecycle hooks to track orchestrator state for the live display."""
+
     def bind(self, orchestrator: "OrchestratorAgent") -> None:
         self._orchestrator = orchestrator
 
-    async def on_llm_start(self, context: Any, agent: Any, system_prompt: Any, input_items: Any) -> None:
+    async def on_llm_start(
+        self, context: Any, agent: Any, system_prompt: Any, input_items: Any
+    ) -> None:
         self._orchestrator.turns += 1
         self._orchestrator.is_thinking = True
 
     async def on_llm_end(self, context: Any, agent: Any, response: Any) -> None:
         self._orchestrator.is_thinking = False
-        if self._orchestrator._reasoning_effort is not None:
-            self._orchestrator._reasoning_effort = None
 
     async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
         self._orchestrator.current_tool = tool.name
 
-    async def on_tool_end(self, context: Any, agent: Any, tool: Any, result: Any) -> None:
+    async def on_tool_end(
+        self, context: Any, agent: Any, tool: Any, result: Any
+    ) -> None:
         self._orchestrator.current_tool = None
 
 
 class OrchestratorAgent:
-    """Orchestrator agent that manages a pool of sandbox agents to complete user tasks."""
-    def __init__(
-        self,
-        model: str,
-        sandbox_client: ModalSandboxClient,
-        sandbox_options: ModalSandboxClientOptions,
-        trace_id: str,
-    ) -> None:
-        self._sandbox_client = sandbox_client
-        self._trace_id = trace_id
+    """Orchestrator that manages a pool of local subagents to complete user tasks."""
 
-        # Prepare an pool of sandbox subagents
-        self._pool = SubAgentPool(
-            client=sandbox_client,
-            options=sandbox_options,
-            model=model,
-        )
+    def __init__(self, model: OpenAIChatCompletionsModel) -> None:
+        self._pool = SubAgentPool(model=model)
 
-        self._reasoning_effort: ReasoningEffort | None = None
+        # Kept as None for display.py compatibility
+        self._reasoning_effort: None = None
         self.turns: int = 0
         self.current_tool: str | None = None
         self.status: str | None = None
         self.is_thinking: bool = False
-
-        # Registry mapping label → (image_id, description) for images captured via snapshot_image.
-        self._image_registry: dict[str, tuple[str, str]] = {}
         self.loaded_skills: list[str] = []
 
         orchestrator_hooks = OrchestratorHooks()
@@ -103,14 +136,10 @@ class OrchestratorAgent:
             hooks=orchestrator_hooks,
             tools=[
                 function_tool(self.set_status),
-                function_tool(self.set_reasoning_effort),
                 function_tool(self.list_skills),
                 function_tool(self.load_skill),
                 function_tool(self.spawn_subagent),
                 function_tool(self.list_subagents),
-                function_tool(self.gpu_capacity),
-                function_tool(self.snapshot_image),
-                function_tool(self.list_images),
                 function_tool(self.invoke_subagent),
                 function_tool(self.wait_for_subagent_result),
                 function_tool(self.wait_for_first_subagent_result),
@@ -130,15 +159,72 @@ class OrchestratorAgent:
             prompt,
             max_turns=200,
             session=self._session,
-            run_config=RunConfig(
-                trace_id=self._trace_id,
-                model_settings=ModelSettings(
-                    reasoning=Reasoning(effort=self._reasoning_effort),
-                ),
-            ),
         )
         display.stop()
         return result.final_output or ""
+
+    async def run_streamed(self, prompt: str) -> AsyncGenerator[StreamChunk, None]:
+        """Stream orchestrator events in real time.
+
+        Yields StreamChunk objects as the orchestrator thinks, calls tools,
+        and receives tool results. The final summary arrives as a tool_call
+        chunk with tool_name="finish".
+        """
+        streaming = Runner.run_streamed(
+            self._agent,
+            prompt,
+            max_turns=200,
+            session=self._session,
+        )
+        async for event in streaming.stream_events():
+            if isinstance(event, RawResponsesStreamEvent):
+                if isinstance(event.data, ResponseTextDeltaEvent):
+                    yield StreamChunk(content=event.data.delta, type="text")
+                elif isinstance(event.data, ResponseReasoningTextDeltaEvent):
+                    yield StreamChunk(content=event.data.delta, type="thinking")
+
+            elif isinstance(event, RunItemStreamEvent):
+                item = event.item
+                if isinstance(item, ToolCallItem):
+                    raw = item.raw_item
+                    call_id = getattr(raw, "call_id", None)
+                    tool_name = getattr(raw, "name", None)
+                    args_str = getattr(raw, "arguments", None) or "{}"
+                    try:
+                        args = json.loads(args_str)
+                    except json.JSONDecodeError:
+                        args = {"_raw": args_str}
+                    yield StreamChunk(
+                        content=args_str,
+                        type="tool_call",
+                        tool_name=tool_name,
+                        tool_args=args,
+                        tool_call_id=call_id,
+                    )
+                elif isinstance(item, ToolCallOutputItem):
+                    raw = item.raw_item
+                    call_id = (
+                        raw.get("call_id")
+                        if isinstance(raw, dict)
+                        else getattr(raw, "call_id", None)
+                    )
+                    yield StreamChunk(
+                        content=str(item.output),
+                        type="tool_output",
+                        tool_call_id=call_id,
+                    )
+                elif isinstance(item, ReasoningItem):
+                    text = "".join(
+                        c.text
+                        for c in (item.raw_item.content or [])
+                        if hasattr(c, "text")
+                    )
+                    if text:
+                        yield StreamChunk(content=text, type="thinking_done")
+                elif isinstance(item, MessageOutputItem):
+                    text = ItemHelpers.text_message_output(item)
+                    if text:
+                        yield StreamChunk(content=text, type="message_done")
 
     ## -----
     ## Tools
@@ -148,11 +234,6 @@ class OrchestratorAgent:
         Call this before every tool invocation unless the status is unchanged."""
         self.status = status
         return "Status updated."
-
-    def set_reasoning_effort(self, effort: ReasoningEffort) -> str:
-        """Set the reasoning effort for the subsequent LLM call. Resets to None (disabled) automatically."""
-        self._reasoning_effort = effort
-        return f"Reasoning effort set to {effort}. Proceed to plan and execute the next steps."
 
     _SKILLS_DIR = Path(__file__).parent / "skills"
 
@@ -176,23 +257,12 @@ class OrchestratorAgent:
             return "No active subagents."
         return "\n".join(e.text_summary() for e in entries)
 
-    def gpu_capacity(self) -> str:
-        """Check available GPU capacity across all types in the pool.
-        Returns limit, running count, and available slots per GPU type."""
-        capacity = self._pool.gpu_capacity()
-        lines = []
-        for gpu_type, info in capacity.items():
-            lines.append(f"{gpu_type}: {info['running']}/{info['limit']} running")
-        return "\n".join(lines)
-
     async def spawn_subagent(
         self,
         agent_name: str,
-        objective: str = "You are a general purpose coding agent with access to a shell.",
-        gpu: Literal["H100", "H100:8"] | None = None,
-        image_id: str | None = None,
+        objective: str = "You are a general purpose coding agent with access to a local shell.",
     ) -> str:
-        """Spawn a new sandbox subagent with the given name and objective.
+        """Spawn a new local subagent with the given name and objective.
         Returns the subagent's unique ID, which must be used for subsequent invoke_subagent calls.
 
         The objective becomes the subagent's instructions (system prompt) - its persistent role
@@ -202,51 +272,9 @@ class OrchestratorAgent:
         Arguments:
             agent_name: A short human-readable label for this subagent.
             objective: The subagent's persistent role and scope (becomes its instructions/system prompt).
-                       Example: "You are a benchmarking agent responsible for measuring GPU throughput."
-            gpu: Optional GPU type to attach to this subagent's sandbox.
-            image_id: Optional Modal image ID to boot from (e.g. from snapshot_image or list_images).
-                      The sandbox filesystem will be restored from that snapshot.
         """
-        try:
-            entry = await self._pool.create(agent_name, objective, gpu=gpu, image_id=image_id)
-        except ValueError as exc:
-            gpu_type = str(exc)
-            return (
-                f"No more {gpu_type}s can be spawned, limit hit. "
-                f"Consider a different gpu type. "
-                f"If {gpu_type} is needed, consider deleting idle subagents."
-            )
+        entry = await self._pool.create(agent_name, objective)
         return f"Subagent '{agent_name}' spawned with id={entry.id}"
-
-    async def snapshot_image(self, agent_id: str, label: str, description: str) -> str:
-        """Freeze a subagent's sandbox filesystem as a Modal image and store it in the image registry.
-
-        The image can later be used to boot a new subagent from the same filesystem state by
-        passing the returned image ID (or the label) to spawn_subagent.
-
-        Arguments:
-            agent_id: ID of the subagent whose filesystem to snapshot.
-            label: A short human-readable label to identify this image in the registry.
-            description: A two-sentence description of what this image contains and what it was built for.
-        """
-        entry = self._pool.get(agent_id)
-        if entry is None:
-            return f"Subagent '{agent_id}' not found."
-        try:
-            image_id = await entry.modal_session.snapshot_filesystem()
-        except Exception as exc:
-            return f"Snapshot failed: {exc}"
-        self._image_registry[label] = (image_id, description)
-        return f"Snapshot complete. label={label!r} image_id={image_id}"
-
-    def list_images(self) -> str:
-        """List all images captured via snapshot_image, with their labels, Modal image IDs, and descriptions."""
-        if not self._image_registry:
-            return "No images captured yet."
-        return "\n".join(
-            f"{label}: {image_id}\n  {description}"
-            for label, (image_id, description) in self._image_registry.items()
-        )
 
     async def delete_subagent(self, agent_id: str) -> str:
         """Terminate a subagent and free its resources when done."""
@@ -257,7 +285,7 @@ class OrchestratorAgent:
         return f"Subagent '{agent_id}' terminated."
 
     async def delete_all(self) -> None:
-        """Terminate all sandbox sessions."""
+        """Terminate all subagent sessions."""
         await self._pool.delete_all()
 
     async def invoke_subagent(self, agent_id: str, message: str) -> str:
@@ -267,9 +295,8 @@ class OrchestratorAgent:
         if entry is None:
             return f"Subagent '{agent_id}' not found. Use spawn_subagent first."
         if entry.run_task is not None and not entry.run_task.done():
-            return f"Subagent '{agent_id}' is still running. Use wait_for_subagent_result tool to await its result."
-
-        await entry.run(message, trace_id=self._trace_id)
+            return f"Subagent '{agent_id}' is still running. Use wait_for_subagent_result to await its result."
+        await entry.run(message)
         return f"Subagent '{agent_id}' task started."
 
     async def wait_for_subagent_result(self, agent_id: str) -> str:
@@ -279,21 +306,25 @@ class OrchestratorAgent:
             return f"Subagent '{agent_id}' not found."
         if entry.run_task is None:
             return f"Subagent '{agent_id}' has no active task."
-
         result = await entry.run_task
-        entry.run_task = None # mark as done
+        entry.run_task = None
         return result.final_output or ""
 
     async def wait_for_first_subagent_result(self) -> str:
         """Block until any running subagent finishes and return its ID and result."""
-        running = {e.run_task: e for e in self._pool._entries.values() if e.run_task and not e.run_task.done()}
+        running = {
+            e.run_task: e
+            for e in self._pool._entries.values()
+            if e.run_task and not e.run_task.done()
+        }
         if not running:
             return "No running subagents."
-        done, _ = await asyncio.wait(running.keys(), return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait(
+            running.keys(), return_when=asyncio.FIRST_COMPLETED
+        )
         entry = running[next(iter(done))]
         result = await self.wait_for_subagent_result(entry.id)
         return f"Subagent '{entry.id}' ({entry.name}) completed: {result}"
-
 
     def finish(self, summary: str) -> str:
         """Signal completion with a concise summary of what was accomplished,
@@ -304,4 +335,3 @@ class OrchestratorAgent:
             summary: A concise summary of what was accomplished.
         """
         return summary
-
