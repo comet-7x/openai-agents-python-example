@@ -1,5 +1,5 @@
 # Parallel Agents with OpenAI Agent SDK and Modal
-This repo is an example of using OpenAI Agents SDK and Modal Sandboxes to implement a general purpose coding agent harness with async parallel workers. 
+This repo is an example of using OpenAI Agents SDK and Modal Sandboxes to implement a general purpose coding agent harness with async parallel workers.
 
 <p align="center">
   <img src="static/screenshot.png" alt="Harness Screenshot" style="max-width: 100%;" />
@@ -29,7 +29,7 @@ This installs the [OpenAI Agents SDK](https://openai.github.io/openai-agents-pyt
 ### Authentication
 You will need to create an account with Modal, which includes $30 free credits to get started. To do so:
 1. [Sign up to Modal](https://modal.com/signup)
-2. Run `modal setup` in your terminal to authenticate. 
+2. Run `modal setup` in your terminal to authenticate.
 
 ## Running
 
@@ -48,13 +48,13 @@ uv run main.py --interactive
 ## Architecture
 
 ### Orchestrator Agent
-The [orchestrator agent](/orchestrator.py) is the primary chat agent equipped with a `Session` memory, subagents-as-tools, a skills subsystem and Subagent pool subsystem. 
+The [orchestrator agent](/orchestrator.py) is the primary chat agent equipped with a `Session` memory, subagents-as-tools, a skills subsystem and Subagent pool subsystem.
 
 ### Subagent Pool
 The orchestrator owns [a pool of subagents](/subagent_pool.py), running as asyncio tasks to allow the orchestrator to delegate messages without blocking. The Pool enforces a strict GPU limit to ensure the orchestrator does not explode GPU budget on unproven tasks. Individual GPU type limits are configurable.
 
 ### Subagents
-The [subagents](/subagent.py) are your "coding agents" with shell and file tools. They are implemented as tools to the orchestrator agent, allowing implementation details for each experiment to accumulate in the subagent and not bloat the orchestrator's context window. 
+The [subagents](/subagent.py) are your "coding agents" with shell and file tools. They are implemented as tools to the orchestrator agent, allowing implementation details for each experiment to accumulate in the subagent and not bloat the orchestrator's context window.
 
 Each subagent has their own `Session` working memory and attached `ModalSandboxSession`. A subagent is a 1:1 map to a running sandbox.
 <br>
@@ -66,7 +66,7 @@ Each subagent has their own `Session` working memory and attached `ModalSandboxS
 BaseSandboxClient[ [ModalSandboxClientOptions](#modalsandboxclientoptions) ]
 
 ```python
-from agents.extensions.sandbox.modal import ModalSandboxClient 
+from agents.extensions.sandbox.modal import ModalSandboxClient
 ```
 
 Top-level client. Creates, resumes, and deletes Modal-backed sandbox sessions.

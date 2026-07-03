@@ -1,0 +1,57 @@
+# 安装(注册三类钩子):
+#   uv run pre-commit install --hook-type pre-commit --hook-type commit-msg --hook-type pre-push
+# 全量手动跑:uv run pre-commit run --all-files
+
+# 不跑钩子的目录(注意:不排除 tests/,测试代码也要过 lint/format)
+exclude: ^(docs/|migrations/|legacy_code/)
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: detect-private-key
+      - id: debug-statements
+
+  # 秘密扫描:比 detect-private-key 更全(token / 密码 / 高熵串)
+  # 如需管理误报,可生成基线:uv run detect-secrets scan > .secrets.baseline
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+
+  # Ruff:lint(自动修复)+ format。bandit 检查已并入 ruff 的 S 规则,故不再单独装 bandit
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.0
+    hooks:
+      - id: ruff-check
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # 提交信息 / 分支名规范(Conventional Commits),便于干净 git 历史与自动 changelog
+  - repo: https://github.com/commitizen-tools/commitizen
+    rev: v4.8.3
+    hooks:
+      - id: commitizen
+        stages: [commit-msg]
+      - id: commitizen-branch
+        stages: [pre-push]
+
+  # 慢检查放 pre-push,不拖慢每次 commit;pytest 全量交给 CI
+  - repo: local
+    hooks:
+      - id: pyright
+        name: pyright
+        entry: uv run pyright
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [pre-push]

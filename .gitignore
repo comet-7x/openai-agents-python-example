@@ -1,6 +1,38 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 虚拟环境 / uv
+.venv/
+.python-version
+
+# 测试 / 覆盖率
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# 类型检查缓存
+.pyright/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 环境变量与密钥
 .env
-uv.lock
-*.db
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+
+# 个人测试文件
+poc/
