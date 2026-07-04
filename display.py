@@ -8,7 +8,6 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-
 from subagent_pool import SubAgentPool
 
 if TYPE_CHECKING:
@@ -74,9 +73,9 @@ class LiveDisplay:
 
         state_styles: dict[str, tuple[str, str]] = {
             "running": ("yellow", _SPINNER_FRAMES[self._frame % len(_SPINNER_FRAMES)]),
-            "done":    ("green",  "✓"),
-            "error":   ("red",    "✗"),
-            "idle":    ("dim",    "·"),
+            "done": ("green", "✓"),
+            "error": ("red", "✗"),
+            "idle": ("dim", "·"),
         }
         for agent in entries:
             style, icon = state_styles.get(agent.state, ("", "?"))

@@ -36,3 +36,9 @@ htmlcov/
 
 # 个人测试文件
 poc/
+
+# 子代理工作目录
+workspaces/
+
+# 运行事件追踪 (JSONL traces)
+logs/
