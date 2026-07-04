@@ -7,7 +7,13 @@ dependencies = [
     "rich>=13.1.0,<15",
     "python-dotenv>=1.0",
     "httpx[socks]>=0.28.1",
+    "pyyaml>=6.0",
+    "openpyxl>=3.1",
+    "pandas>=2.2",
 ]
+
+[project.scripts]
+comet = "comet.cli:run"
 
 [dependency-groups]
 dev = [
@@ -52,7 +58,7 @@ testpaths = ["tests"]
 asyncio_mode = "auto"        # async def test_* 自动识别,无需逐个标记
 addopts = [
     "--strict-markers",
-    "--cov=comet_project",
+    "--cov=comet",
     "--cov-report=term-missing",
     "--cov-report=xml",
 ]

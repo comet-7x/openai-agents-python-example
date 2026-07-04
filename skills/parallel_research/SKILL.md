@@ -1,6 +1,11 @@
+---
+name: parallel_research
+description: Operational playbook for running ML experiments in parallel across worker agents (setup-agent + snapshot pattern, aggressive parallel launch, result triage). Load when planning or executing multiple ML experiments that can run concurrently.
+---
+
 # Parallel ML Research
 
-Use this skill when running ML experiments that can be parallelized across sandbox subagents.
+Use this skill when running ML experiments that can be parallelized across worker agents.
 
 ---
 

@@ -1,34 +1,35 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
 
 from rich.console import Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from subagent_pool import SubAgentPool
 
-if TYPE_CHECKING:
-    from orchestrator import OrchestratorAgent
+from comet.display.view import SystemView
 
 _SPINNER_FRAMES = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]
 
 
 class LiveDisplay:
-    """Live updating display showing orchestrator state and the subagent pool."""
+    """Live display of orchestrator + subagent state.
 
-    def __init__(self, orchestrator: OrchestratorAgent, pool: SubAgentPool) -> None:
-        self._orchestrator = orchestrator
-        self._pool = pool
+    Push-based renderer of a `SystemView` (which the composition root keeps fed
+    from the message bus). It holds no reference to any agent, which is what
+    keeps the display decoupled from `comet.agents`.
+    """
+
+    def __init__(self, view: SystemView) -> None:
+        self._view = view
         self._frame = 0
         self._live = Live(auto_refresh=False, transient=False)
         self._task: asyncio.Task[None] | None = None
 
     def _render_orchestrator(self) -> Panel:
-        orch = self._orchestrator
-        reasoning = orch._reasoning_effort or "-"
+        orch = self._view.orchestrator
+        reasoning = orch.reasoning_effort or "-"
         tool = orch.current_tool or "-"
         turns = orch.turns
 
@@ -62,7 +63,7 @@ class LiveDisplay:
         return Panel(content, title="Orchestrator", border_style="dim")
 
     def _render_subagents(self) -> Panel:
-        entries = self._pool.list_entries()
+        entries = self._view.subagent_list()
         table = Table(box=None, show_header=True, padding=(0, 2), header_style="dim", expand=True)
         table.add_column("", width=2)
         table.add_column("Agent")

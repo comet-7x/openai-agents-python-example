@@ -1,3 +1,8 @@
+---
+name: parameter_golf
+description: Rules, scoring, and submission constraints for OpenAI's Parameter Golf challenge (train the smallest/most efficient language model within a fixed parameter budget). Load when the task is specifically about the Parameter Golf competition.
+---
+
 # Parameter Golf
 
 ## Premise

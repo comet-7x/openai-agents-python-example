@@ -48,15 +48,15 @@ uv run main.py --interactive
 ## Architecture
 
 ### Orchestrator Agent
-The [orchestrator agent](/orchestrator.py) is the primary chat agent equipped with a `Session` memory, subagents-as-tools, a skills subsystem and Subagent pool subsystem.
+The [orchestrator agent](/orchestrator.py) is the primary chat agent equipped with a `Session` memory, worker agents-as-tools, a skills subsystem and worker agent pool subsystem.
 
-### Subagent Pool
-The orchestrator owns [a pool of subagents](/subagent_pool.py), running as asyncio tasks to allow the orchestrator to delegate messages without blocking. The Pool enforces a strict GPU limit to ensure the orchestrator does not explode GPU budget on unproven tasks. Individual GPU type limits are configurable.
+### Worker Agent Pool
+The orchestrator owns [a pool of worker agents](/worker_agent_pool.py), running as asyncio tasks to allow the orchestrator to delegate messages without blocking. The Pool enforces a strict GPU limit to ensure the orchestrator does not explode GPU budget on unproven tasks. Individual GPU type limits are configurable.
 
-### Subagents
-The [subagents](/subagent.py) are your "coding agents" with shell and file tools. They are implemented as tools to the orchestrator agent, allowing implementation details for each experiment to accumulate in the subagent and not bloat the orchestrator's context window.
+### Worker Agents
+The [worker agents](/worker_agent.py) are your "coding agents" with shell and file tools. They are implemented as tools to the orchestrator agent, allowing implementation details for each experiment to accumulate in the worker agent and not bloat the orchestrator's context window.
 
-Each subagent has their own `Session` working memory and attached `ModalSandboxSession`. A subagent is a 1:1 map to a running sandbox.
+Each worker agent has their own `Session` working memory and attached `ModalSandboxSession`. A worker agent is a 1:1 map to a running sandbox.
 <br>
 <br>
 
