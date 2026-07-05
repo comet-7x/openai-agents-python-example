@@ -37,6 +37,18 @@ def test_no_agents_display_cycle() -> None:
         assert not _imports(p, "comet.display"), p
 
 
+def test_stream_module_is_a_leaf() -> None:
+    # StreamChunk is agent-agnostic and must not import any other comet module,
+    # or it stops being a safe shared home (this is why it was pulled out of
+    # orchestrator.py). It must also stay importable from its new location.
+    from comet.agents.stream import StreamChunk
+
+    assert StreamChunk(content="x").type == "text"  # importable + sane default
+
+    stream = COMET / "agents" / "stream.py"
+    assert not _imports(stream, "comet"), stream
+
+
 def test_config_paths_anchored_to_repo_root() -> None:
     assert config.REPO_ROOT == REPO_ROOT
     assert config.SKILLS_DIR == REPO_ROOT / "skills"
