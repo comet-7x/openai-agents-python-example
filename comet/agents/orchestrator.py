@@ -1,10 +1,8 @@
 import asyncio
 import json
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal
-from zoneinfo import ZoneInfo
+from typing import Any
 
 from agents import (
     Agent,
@@ -31,36 +29,11 @@ from openai.types.responses import (
 )
 
 from comet import config
+from comet.agents.stream import StreamChunk
 from comet.agents.worker_pool import WorkerAgentPool
 from comet.message_bus import events as ev
 from comet.message_bus.bus import MessageBus
 from comet.skills.registry import SkillError, SkillsRegistry
-
-
-@dataclass
-class StreamChunk:
-    """A single streamed event from the orchestrator.
-
-    type values:
-      "text"          — final-answer token delta (streamed, use to print in real time)
-      "thinking"      — reasoning token delta (streamed; only fires on reasoning models)
-      "tool_call"     — orchestrator called a tool (complete, not delta)
-      "tool_output"   — tool returned a result (complete)
-      "thinking_done" — full reasoning block finished (content = complete reasoning text)
-      "message_done"  — the orchestrator's current message is complete
-
-    "thinking" / "thinking_done" are emitted when the model supports reasoning
-    (e.g. o1, o3). They are safe to ignore or use as a flag / debug trace.
-    """
-
-    content: str
-    type: Literal[
-        "text", "thinking", "tool_call", "tool_output", "thinking_done", "message_done"
-    ] = "text"
-    tool_name: str | None = field(default=None)
-    tool_args: dict[str, Any] | None = field(default=None)
-    tool_call_id: str | None = field(default=None)
-
 
 ORCHESTRATOR_INSTRUCTIONS = """
 You are a relentless execution agent. Your only job is to get the user's task fully done - not \
@@ -93,6 +66,14 @@ Some skills bundle reference docs or scripts - use list_skill_resources and
 read_skill_reference to pull those in only when you actually need them; hand
 script paths to a worker agent's shell tool to run them.
 """
+
+
+def _orchestrator_instructions(_ctx: Any, _agent: Any) -> str:
+    """Build the system prompt, rebuilt per turn so the embedded timestamp stays
+    current across a long interactive session (a plain formatted string would
+    freeze at construction time). The SDK invokes this on every run."""
+    now = datetime.now(config.TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %A")
+    return ORCHESTRATOR_INSTRUCTIONS.format(time=now)
 
 
 class OrchestratorHooks(AgentHooks):  # type: ignore[type-arg]
@@ -131,19 +112,18 @@ class OrchestratorAgent:
         bus: MessageBus | None = None,
         session_id: str | None = None,
     ) -> None:
-        self.bus = bus or MessageBus()
-        self._bus = self.bus  # internal alias used by hooks/tools
+        self._bus = bus or MessageBus()
 
         # One workspace per session, shared by all subagents so their files
         # (reports, data) are visible to each other and persist across turns.
-        self.session_id = session_id or datetime.now(ZoneInfo("Asia/Shanghai")).strftime(
+        self.session_id = session_id or datetime.now(config.TIMEZONE).strftime(
             "sess_%Y%m%d_%H%M%S"
         )
         self.session_workspace = config.WORKSPACES_ROOT / self.session_id
         self.session_workspace.mkdir(parents=True, exist_ok=True)
 
         self._pool = WorkerAgentPool(
-            model=model, bus=self.bus, session_workspace=self.session_workspace
+            model=model, bus=self._bus, session_workspace=self.session_workspace
         )
         self._skills = SkillsRegistry(config.SKILLS_DIR)
 
@@ -161,11 +141,7 @@ class OrchestratorAgent:
         self._agent = Agent(
             name="Orchestrator Agent",
             model=model,
-            instructions=ORCHESTRATOR_INSTRUCTIONS.format(
-                time=lambda: datetime.now(ZoneInfo("Asia/Shanghai")).strftime(
-                    "%Y-%m-%d %H:%M:%S %A"
-                )
-            ),
+            instructions=_orchestrator_instructions,
             model_settings=ModelSettings(tool_choice="auto"),
             tool_use_behavior=StopAtTools(stop_at_tool_names=["finish"]),
             hooks=orchestrator_hooks,
@@ -190,7 +166,7 @@ class OrchestratorAgent:
     async def run(self, prompt: str) -> str:
         """Run a single turn with the orchestrator.
 
-        Emits events on `self.bus`; attaching a live display is the caller's job
+        Emits events on `self._bus`; attaching a live display is the caller's job
         (see cli.py). The orchestrator no longer knows about any display.
         """
         result = await Runner.run(
@@ -262,9 +238,7 @@ class OrchestratorAgent:
                     if text:
                         yield StreamChunk(content=text, type="message_done")
 
-    ## -----
     ## Tools
-
     def set_status(self, status: str) -> str:
         """Set a one-sentence status summary shown in the live display.
         Call this before every tool invocation unless the status is unchanged."""

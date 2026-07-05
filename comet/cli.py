@@ -20,7 +20,8 @@ from rich.text import Text
 
 import comet.tools.bash as _bash
 from comet import config
-from comet.agents.orchestrator import OrchestratorAgent, StreamChunk
+from comet.agents.orchestrator import OrchestratorAgent
+from comet.agents.stream import StreamChunk
 from comet.display.display import LiveDisplay
 from comet.display.view import SystemView
 from comet.llm.models import ConcurrencyLimitedModel

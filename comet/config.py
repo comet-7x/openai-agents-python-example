@@ -13,7 +13,9 @@ one place here fixes that class of bug.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -33,6 +35,20 @@ WORKSPACES_ROOT = REPO_ROOT / "workspaces"
 # Per-run event traces written by the JSONL bus sink (observability/audit).
 TRACES_DIR = REPO_ROOT / "logs"
 TRACE_ENABLED = os.environ.get("COMET_TRACE", "1") != "0"
+
+# Timezone for user-facing timestamps — the system-prompt "Today is:" line and
+# session-id stamps. Set COMET_TZ to any IANA name (e.g. "America/New_York",
+# "UTC"); otherwise defaults to Asia/Shanghai. An unknown name falls back to the
+# default with a warning rather than crashing the whole app at import.
+_TZ_NAME = os.environ.get("COMET_TZ", "Asia/Shanghai")
+try:
+    TIMEZONE = ZoneInfo(_TZ_NAME)
+except (ZoneInfoNotFoundError, ValueError):
+    print(
+        f"[comet.config] unknown COMET_TZ={_TZ_NAME!r}; falling back to Asia/Shanghai",
+        file=sys.stderr,
+    )
+    TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 # ── LLM backend settings ─────────────────────────────────────────────────────
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "")
