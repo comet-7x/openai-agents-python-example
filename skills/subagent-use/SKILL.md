@@ -1,5 +1,5 @@
 ---
-name: subagent_use
+name: subagent-use
 description: How to plan, schedule, and delegate work to subagents - sequential vs parallel scheduling, allocating skills before spawning, using the shared session workspace, and collecting results. Load this at the start of any task you will complete by delegating to subagents.
 ---
 # Using subagents
