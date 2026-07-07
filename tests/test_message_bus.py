@@ -59,6 +59,29 @@ def test_systemview_reduces_events() -> None:
     assert view.subagent_list() == []
 
 
+def test_systemview_sums_usage() -> None:
+    view = SystemView()
+    view.apply(ev.UsageReported(source="orchestrator", requests=2, input_tokens=100,
+                                output_tokens=40, total_tokens=140, elapsed_s=1.5))
+    view.apply(ev.UsageReported(source="s1", requests=1, input_tokens=30,
+                                output_tokens=10, total_tokens=40, elapsed_s=0.5))
+    u = view.usage
+    assert (u.requests, u.input_tokens, u.output_tokens, u.total_tokens) == (3, 130, 50, 180)
+    assert u.runs == 2
+    assert u.agent_seconds == 2.0
+
+
+def test_usage_from_usage_is_duck_typed() -> None:
+    class FakeUsage:
+        requests, input_tokens, output_tokens, total_tokens = 1, 10, 5, 15
+
+    e = ev.UsageReported.from_usage("s1", FakeUsage(), 0.25)
+    assert (e.source, e.total_tokens, e.elapsed_s) == ("s1", 15, 0.25)
+    # None (an errored run with no result) degrades to zero tokens, keeps time.
+    z = ev.UsageReported.from_usage("s2", None, 0.9)
+    assert (z.total_tokens, z.elapsed_s) == (0, 0.9)
+
+
 def test_jsonl_logger_captures_spawn_skills(tmp_path) -> None:
     logger = JsonlLogger(tmp_path / "trace.jsonl")
     logger.handle(ev.SubagentSpawned(id="s1", name="A", skills=("xlsx",)))
