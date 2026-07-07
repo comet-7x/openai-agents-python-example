@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import os
 import sys
+import time
 
 # Running this file directly (`python comet/cli.py`) puts the comet/ directory on
 # sys.path[0], which shadows the third-party `agents` package with our own
@@ -10,6 +11,7 @@ import sys
 if os.path.basename(sys.path[0] or "") == "comet":
     sys.path[0] = os.path.dirname(sys.path[0])
 
+import httpx
 from agents import set_tracing_disabled
 from openai import AsyncOpenAI
 from rich.console import Console, Group, RenderableType
@@ -22,7 +24,7 @@ import comet.tools.bash as _bash
 from comet import config
 from comet.agents.orchestrator import OrchestratorAgent
 from comet.agents.stream import StreamChunk
-from comet.display.display import LiveDisplay
+from comet.display.display import LiveDisplay, format_clock, format_duration
 from comet.display.view import SystemView
 from comet.llm.models import ConcurrencyLimitedModel
 from comet.message_bus.bus import MessageBus
@@ -54,16 +56,21 @@ class StreamUI:
     _ARROW_IN = "↩"
     _KEY_WIDTH = 18
     _VAL_WIDTH = 120
+    _REASONING_WIDTH = 72  # rolling tail of live reasoning shown in the spinner line
     _transient = True  # subclasses set False to keep the Live area visible on stop
 
     def __init__(self) -> None:
         self._console = Console(highlight=False)
         self._frame = 0
-        self._status_msg = "Thinking…"
+        # "Waiting…" = request in flight, no token yet (time-to-first-token); it
+        # becomes "Reasoning…" if reasoning deltas arrive, or the answer text itself
+        # once content streams. Mirrors the OrchestratorPhase waiting/thinking split.
+        self._status_msg = "Waiting…"
         self._pending: dict[str, str] = {}  # call_id → tool_name
         self._last_char = "\n"
         self._text_buf = ""  # partial line shown inside the Live area
         self._thinking = False  # True while receiving "thinking" deltas
+        self._reasoning_buf = ""  # accumulated reasoning text for the live tail preview
         # _make_renderable() reads _text_buf/_status_msg, so init those first
         self._live = Live(
             self._make_renderable(),
@@ -108,25 +115,36 @@ class StreamUI:
             # tool calls and those would print as spurious blank lines.
             if not chunk.content.strip():
                 return
+            # Reasoning that streamed but never got a thinking_done (it arrives
+            # late, after text starts, on some backends) is committed here before
+            # the answer so it isn't lost or printed out of order.
+            if self._thinking:
+                self._commit_reasoning(self._reasoning_buf)
+                self._thinking = False
+                self._reasoning_buf = ""
+                self._set_waiting()
             self._write_text(chunk.content)
 
         elif chunk.type == "thinking":
-            # Reasoning token delta — show "Reasoning…" in the spinner while
-            # it streams. Actual content is surfaced via thinking_done.
+            # Reasoning token delta — accumulate and show the rolling tail live in
+            # the spinner line (not a growing block), so you watch the model think
+            # in real time. A one-line record is committed to scrollback on done.
             if not self._thinking:
                 self._thinking = True
-                self._status_msg = "Reasoning…"
-                self._live.update(self._make_renderable(), refresh=True)
+                self._reasoning_buf = ""
+            self._reasoning_buf += chunk.content
+            self._status_msg = self._reasoning_status(self._reasoning_buf)
+            self._live.update(self._make_renderable(), refresh=True)
 
         elif chunk.type == "thinking_done":
-            # Full reasoning block complete — show a dim one-line preview.
-            self._thinking = False
-            preview = chunk.content.strip().replace("\n", " ")
-            if len(preview) > self._VAL_WIDTH:
-                preview = preview[: self._VAL_WIDTH - 1] + "…"
-            self._live.console.print(f"  [dim italic]◌ {preview}[/dim italic]")
-            self._last_char = "\n"
-            self._set_thinking()
+            # Commit the reasoning as one dim line — but only while still
+            # mid-reasoning. A late thinking_done (after text already started and
+            # committed the reasoning) is a duplicate and dropped.
+            if self._thinking:
+                self._commit_reasoning(chunk.content or self._reasoning_buf)
+                self._thinking = False
+                self._reasoning_buf = ""
+                self._set_waiting()
 
         elif chunk.type == "tool_call":
             self._render_tool_call(chunk)
@@ -150,9 +168,34 @@ class StreamUI:
         frame = _SPINNER_FRAMES[self._frame % len(_SPINNER_FRAMES)]
         return Text(f"{frame} {self._status_msg}", style="yellow dim")
 
-    def _set_thinking(self) -> None:
-        self._status_msg = "Thinking…"
+    def _set_waiting(self) -> None:
+        """Revert the spinner to the awaiting-next-LLM-output state."""
+        self._status_msg = "Waiting…"
         self._live.update(self._make_renderable(), refresh=True)
+
+    def _reasoning_status(self, buf: str) -> str:
+        """Build the live spinner label from the reasoning so far: a single line
+        showing the trailing (most recent) reasoning, so it reads as the model's
+        current thought rather than freezing on the opening sentence."""
+        tail = " ".join(buf.split())  # collapse newlines/runs of whitespace
+        if not tail:
+            return "Reasoning…"
+        if len(tail) > self._REASONING_WIDTH:
+            tail = "…" + tail[-(self._REASONING_WIDTH - 1) :]
+        return f"Reasoning… {tail}"
+
+    def _commit_reasoning(self, text: str) -> None:
+        """Print the finished reasoning as one dim line above the Live area — a
+        permanent record in scrollback, since the live tail in the spinner is
+        ephemeral and vanishes once the answer or next tool call starts."""
+        line = " ".join(text.split())
+        if not line:
+            return
+        if len(line) > self._VAL_WIDTH:
+            line = line[: self._VAL_WIDTH - 1] + "…"
+        self._flush_text()
+        self._live.console.print(f"[dim italic]◌ Reasoning · {line}[/dim italic]")
+        self._last_char = "\n"
 
     def _set_running(self, tool: str) -> None:
         self._status_msg = f"Running {tool}…"
@@ -255,7 +298,7 @@ class StreamUI:
         tool_name = self._pending.pop(call_id, None) if call_id else None
 
         if tool_name in ("set_status", "finish"):
-            self._set_thinking()
+            self._set_waiting()
             return
 
         content = chunk.content.strip().replace("\n", " ")
@@ -264,34 +307,32 @@ class StreamUI:
 
         self._live.console.print(f"  [dim]{self._ARROW_IN} {content}[/dim]")
         self._last_char = "\n"
-        self._set_thinking()
+        self._set_waiting()
 
 
 class RobustStreamUI(StreamUI):
-    """StreamUI subclass with prev_type transition tracking.
+    """StreamUI subclass that handles common model streaming quirks.
 
-    Mirrors the logic from print_stream() to handle common model quirks:
-
-    1. text   — skips leading whitespace tokens before real content starts
-                (without updating prev_type, same as the `continue` in print_stream);
+    1. thinking / thinking_done
+              — reasoning streams live as a rolling one-line tail in the spinner
+                (see the base class), committed to scrollback as one dim line when
+                it settles. Handles the two ways reasoning ends: an in-order
+                thinking_done (reasoning → tool call), and a late thinking_done that
+                arrives *after* text already started (RunItemStreamEvent fires after
+                the raw deltas) — the text branch commits the reasoning first and the
+                late duplicate is dropped via the `_thinking` guard.
+    2. text   — skips leading whitespace tokens before real content starts;
                 prints an "Answer" header on the first real text token.
-    2. thinking
-              — shows a header only on the first reasoning token
-                (guards with prev_type != "thinking").
-    3. thinking_done
-              — suppressed when it arrives late, i.e. after text has already
-                started (RunItemStreamEvent fires after raw deltas finish).
-    4. message_done
+    3. message_done
               — only flushed/acknowledged when content is non-empty, avoiding
                 spurious blank output from empty MessageOutputItems.
-    5. tool_call / tool_output
+    4. tool_call / tool_output
               — resets _text_started so an "Answer" header can be re-emitted
                 if the model outputs text again after tool results.
     """
 
     def __init__(self) -> None:
         super().__init__()
-        self._prev_type: str | None = None
         self._text_started: bool = False
         self._answer_shown: bool = False  # print "Answer" header only once per run
 
@@ -299,43 +340,38 @@ class RobustStreamUI(StreamUI):
         t = chunk.type
 
         if t == "thinking":
-            if self._prev_type != "thinking":
+            # Accumulate and show the rolling tail live in the spinner line; the
+            # base helpers keep this to one line and commit a record on done.
+            if not self._thinking:
                 self._flush_text()
-                self._live.console.print("[dim italic]◌ Reasoning[/dim italic]")
-                self._last_char = "\n"
                 self._thinking = True
-                self._status_msg = "Reasoning…"
-                self._live.update(self._make_renderable(), refresh=True)
-            # Thinking tokens are not streamed inline (can be very verbose);
-            # the thinking_done block will surface a one-line summary.
+                self._reasoning_buf = ""
+            self._reasoning_buf += chunk.content
+            self._status_msg = self._reasoning_status(self._reasoning_buf)
+            self._live.update(self._make_renderable(), refresh=True)
 
         elif t == "thinking_done":
-            # Late event: thinking_done arrives after text has already started —
-            # reset the thinking flag silently and do NOT update _prev_type.
-            if self._prev_type != "thinking":
+            # Commit only while still mid-reasoning; a late thinking_done (after
+            # text already committed the reasoning) is a duplicate and dropped.
+            if self._thinking:
+                self._commit_reasoning(chunk.content or self._reasoning_buf)
                 self._thinking = False
-                return
-            self._flush_text()
-            if chunk.content.strip():
-                preview = chunk.content.strip().replace("\n", " ")
-                if len(preview) > self._VAL_WIDTH:
-                    preview = preview[: self._VAL_WIDTH - 1] + "…"
-                self._live.console.print(f"  [dim]  {preview}[/dim]")
-                self._last_char = "\n"
-            self._thinking = False
-            self._set_thinking()
+                self._reasoning_buf = ""
+                self._set_waiting()
 
         elif t == "text":
-            # Leading whitespace before any real content — discard and do NOT
-            # update _prev_type (mirrors the `continue` in print_stream).
+            # Leading whitespace before any real content — discard silently.
             if not self._text_started and not chunk.content.strip():
                 return
             if not self._text_started:
                 self._flush_text()
-                # Transition from thinking → text: reset spinner to "Thinking…"
+                # thinking → text: no thinking_done has arrived yet (it comes late),
+                # so commit the streamed reasoning here before the answer begins.
                 if self._thinking:
+                    self._commit_reasoning(self._reasoning_buf)
                     self._thinking = False
-                    self._set_thinking()
+                    self._reasoning_buf = ""
+                    self._set_waiting()
                 self._live.console.print()
                 if not self._answer_shown:
                     self._live.console.print("[bold]Answer[/bold]")
@@ -358,8 +394,6 @@ class RobustStreamUI(StreamUI):
             # message_done chunks — skip them to avoid spurious blank output.
             if chunk.content.strip():
                 self._flush_text()
-
-        self._prev_type = t
 
 
 _STATE_STYLES: dict[str, tuple[str, str]] = {
@@ -385,6 +419,7 @@ class StreamDisplay(RobustStreamUI):
 
     def __init__(self, view: SystemView) -> None:
         self._view = view  # must precede super().__init__()
+        self._start = time.perf_counter()  # live elapsed clock; read in _render_orch_panel
         super().__init__()
 
     # ── override: include orchestrator + subagent panels in the Live area ──────
@@ -407,11 +442,14 @@ class StreamDisplay(RobustStreamUI):
         orch = self._view.orchestrator
         frame = _SPINNER_FRAMES[self._frame % len(_SPINNER_FRAMES)]
 
-        # Panel title carries the animated spinner + current status message,
-        # making it the prominent live indicator at the top of the Live area.
+        # Panel title carries the animated spinner + current status message + a
+        # live elapsed clock, making it the prominent live indicator at the top of
+        # the Live area. The clock ticks because tick() re-renders this each frame.
+        clock = format_clock(time.perf_counter() - self._start)
         title = Text.assemble(
             Text(f"{frame} ", style="yellow dim"),
             Text(self._status_msg, style="yellow dim"),
+            Text(f"  ·  {clock}", style="dim"),
         )
 
         line = Text()
@@ -426,6 +464,14 @@ class StreamDisplay(RobustStreamUI):
         if orch.status:
             line.append("\nStatus: ", style="dim")
             line.append(orch.status, style="italic")
+
+        u = self._view.usage
+        if u.runs:
+            line.append("\nTokens: ", style="dim")
+            line.append(f"{u.total_tokens:,}")
+            line.append(f" (in {u.input_tokens:,} / out {u.output_tokens:,})", style="dim")
+            line.append("   Reqs: ", style="dim")
+            line.append(str(u.requests))
 
         return Panel(line, title=title, title_align="left", border_style="dim")
 
@@ -523,20 +569,33 @@ async def _run_stream(
             # Restart Live — new panels appear below the approval block.
             ui._live.start(refresh=True)
 
+    before = _usage_snapshot(view)
+    start = time.perf_counter()
+    # A single turn must never kill the REPL: capture any failure from the stream
+    # (e.g. an httpx.ReadTimeout when the model connection stalls mid-response) and
+    # report it after the live display tears down, so the session stays alive and
+    # the user can retry. Errors are printed outside the `with` to avoid interleaving
+    # with Rich's Live rendering.
+    error: Exception | None = None
     with StreamDisplay(view) as ui:
         # Print initial status at the top of the output so the user sees
         # immediate feedback before any tool calls scroll in below.
-        ui._live.console.print(Text("⣾ Thinking…", style="yellow dim"))
+        ui._live.console.print(Text("⣾ Waiting…", style="yellow dim"))
         tasks: list[asyncio.Task[None]] = [asyncio.create_task(_spin(ui))]
         if approval_queue is not None:
             tasks.append(asyncio.create_task(_approval_handler(ui)))
         try:
             async for chunk in orchestrator.run_streamed(prompt):
                 ui.on_chunk(chunk)
+        except Exception as e:  # one turn's failure must not crash the whole session
+            error = e
         finally:
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+    if error is not None:
+        _print_turn_error(error)
+    _print_usage_summary(view, before, time.perf_counter() - start)
 
 
 async def _interactive_queue_stream(orchestrator: OrchestratorAgent, view: SystemView) -> None:
@@ -616,6 +675,62 @@ async def _interactive_queue_stream(orchestrator: OrchestratorAgent, view: Syste
         await asyncio.gather(reader, return_exceptions=True)
 
 
+def _usage_snapshot(view: SystemView) -> tuple[int, int, int, int]:
+    u = view.usage
+    return (u.requests, u.input_tokens, u.output_tokens, u.total_tokens)
+
+
+def _print_turn_error(error: Exception) -> None:
+    """Report a turn that failed mid-stream, without killing the session.
+
+    Network/timeout failures (the common case: the model connection going silent
+    past LLM_REQUEST_TIMEOUT) get a targeted hint; anything else is surfaced with
+    its type and message so real bugs stay visible."""
+    console = Console()
+    if isinstance(error, (httpx.HTTPError, TimeoutError)):
+        console.print(
+            Text(
+                f"⚠  Turn interrupted: {type(error).__name__} — the model connection "
+                "stalled or dropped mid-response. Your session is intact; retype your "
+                "request to retry.",
+                style="bold yellow",
+            )
+        )
+        console.print(
+            Text(
+                f"   If this recurs, raise LLM_REQUEST_TIMEOUT in .env "
+                f"(currently {config.LLM_REQUEST_TIMEOUT:.0f}s).",
+                style="dim",
+            )
+        )
+    else:
+        console.print(Text(f"⚠  Turn failed: {type(error).__name__}: {error}", style="bold red"))
+        console.print(Text("   Session preserved — you can continue or retry.", style="dim"))
+
+
+def _print_usage_summary(
+    view: SystemView, before: tuple[int, int, int, int], wall_s: float
+) -> None:
+    """One-line cost report for the turn just finished: token counts consumed
+    since `before` (orchestrator + all subagents) and wall-clock time. Deltas —
+    not session totals — so each turn is billed on its own line; the live panel
+    shows the running session total."""
+    u = view.usage
+    d_req = u.requests - before[0]
+    d_in = u.input_tokens - before[1]
+    d_out = u.output_tokens - before[2]
+    d_tot = u.total_tokens - before[3]
+    Console().print(
+        Text.assemble(
+            Text("  usage · ", style="dim"),
+            Text(f"{d_tot:,} tokens", style="cyan"),
+            Text(f" (in {d_in:,} / out {d_out:,})", style="dim"),
+            Text(f" · {d_req} req", style="dim"),
+            Text(f" · {format_duration(wall_s)}", style="dim"),
+        )
+    )
+
+
 def _new_session() -> tuple[OrchestratorAgent, SystemView]:
     """Compose one session: a bus, a SystemView fed by it, and an orchestrator
     that publishes to it. Displays render the view; nobody polls the agents."""
@@ -639,10 +754,13 @@ async def main(prompt: str | None, interactive: bool, stream: bool) -> None:
             else:
                 display = LiveDisplay(view)
                 display.start()
+                before = _usage_snapshot(view)
+                start = time.perf_counter()
                 try:
                     print(await orchestrator.run(prompt))
                 finally:
                     display.stop()
+                _print_usage_summary(view, before, time.perf_counter() - start)
         finally:
             await orchestrator.delete_all()
         return
@@ -665,10 +783,13 @@ async def main(prompt: str | None, interactive: bool, stream: bool) -> None:
                         continue
                     display = LiveDisplay(view)
                     display.start()
+                    before = _usage_snapshot(view)
+                    start = time.perf_counter()
                     try:
                         print(await orchestrator.run(user_input))
                     finally:
                         display.stop()
+                    _print_usage_summary(view, before, time.perf_counter() - start)
         finally:
             await orchestrator.delete_all()
         return

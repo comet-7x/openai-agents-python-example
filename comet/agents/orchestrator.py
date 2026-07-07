@@ -24,6 +24,7 @@ from agents.items import (
 from agents.memory import SQLiteSession
 from agents.run import Runner
 from openai.types.responses import (
+    ResponseReasoningSummaryTextDeltaEvent,
     ResponseReasoningTextDeltaEvent,
     ResponseTextDeltaEvent,
 )
@@ -85,21 +86,24 @@ class OrchestratorHooks(AgentHooks):  # type: ignore[type-arg]
     async def on_llm_start(
         self, context: Any, agent: Any, system_prompt: Any, input_items: Any
     ) -> None:
-        self._orchestrator.turns += 1
-        self._orchestrator.is_thinking = True
+        # A new LLM call = a new turn. Start it in `waiting` (request in flight, no
+        # output yet). The streamed loop promotes this to `thinking` or `responding`
+        # once deltas arrive; the non-streamed path has no deltas, so it stays
+        # `waiting` until a tool runs or the run ends — honest, rather than claiming
+        # the model is 'thinking' when it may just be time-to-first-token.
         self._orchestrator._bus.publish(ev.OrchestratorTurn())
-        self._orchestrator._bus.publish(ev.OrchestratorThinking(thinking=True))
-
-    async def on_llm_end(self, context: Any, agent: Any, response: Any) -> None:
-        self._orchestrator.is_thinking = False
-        self._orchestrator._bus.publish(ev.OrchestratorThinking(thinking=False))
+        self._orchestrator._bus.publish(ev.OrchestratorPhase(phase="waiting"))
 
     async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
-        self._orchestrator.current_tool = tool.name
         self._orchestrator._bus.publish(ev.OrchestratorTool(tool=tool.name))
+        self._orchestrator._bus.publish(ev.OrchestratorPhase(phase="calling_tool"))
 
     async def on_tool_end(self, context: Any, agent: Any, tool: Any, result: Any) -> None:
-        self._orchestrator.current_tool = None
+        self._orchestrator._bus.publish(ev.OrchestratorTool(tool=None))
+
+    async def on_end(self, context: Any, agent: Any, output: Any) -> None:
+        # Run finished (final output produced): no LLM call in flight.
+        self._orchestrator._bus.publish(ev.OrchestratorPhase(phase="idle"))
         self._orchestrator._bus.publish(ev.OrchestratorTool(tool=None))
 
 
@@ -129,11 +133,10 @@ class OrchestratorAgent:
 
         # Kept as None for display.py compatibility
         self._reasoning_effort: None = None
-        self.turns: int = 0
-        self.current_tool: str | None = None
         self.status: str | None = None
-        self.is_thinking: bool = False
         self.loaded_skills: list[str] = []
+        # Turn count, current tool, and phase are tracked in the SystemView from the
+        # events published below — the orchestrator holds no display-state copies.
 
         orchestrator_hooks = OrchestratorHooks()
         orchestrator_hooks.bind(self)
@@ -190,11 +193,42 @@ class OrchestratorAgent:
             max_turns=200,
             session=self._session,
         )
+        # The hook only sets `waiting` on LLM start; the reasoning→content transition
+        # is observable only here, so this loop promotes `waiting` to `thinking` (first
+        # reasoning delta) and `responding` (first visible-content delta). Deduped so we
+        # publish one event per transition, not per delta (each is logged by JSONL too).
+        streamed_phase: str = ""
+
+        def _phase(p: ev.Phase) -> None:
+            nonlocal streamed_phase
+            if p != streamed_phase:
+                streamed_phase = p
+                self._bus.publish(ev.OrchestratorPhase(phase=p))
+
         async for event in streaming.stream_events():
             if isinstance(event, RawResponsesStreamEvent):
                 if isinstance(event.data, ResponseTextDeltaEvent):
+                    _phase("responding")
                     yield StreamChunk(content=event.data.delta, type="text")
-                elif isinstance(event.data, ResponseReasoningTextDeltaEvent):
+                elif isinstance(
+                    event.data,
+                    (ResponseReasoningTextDeltaEvent, ResponseReasoningSummaryTextDeltaEvent),
+                ):
+                    # Two reasoning channels exist: `*TextDeltaEvent` streams the
+                    # detailed `content` reasoning, `*SummaryTextDeltaEvent` streams the
+                    # `summary` reasoning that o-series and many OpenAI-compatible
+                    # backends actually populate (leaving `content` empty). Listening to
+                    # only one leaves reasoning blank on the others, so we treat both as
+                    # `thinking`.
+                    #
+                    # Phase is monotonic within a turn: once we've started emitting
+                    # the visible answer, a late/interleaved reasoning delta (some
+                    # backends stream reasoning and content interleaved) must not flip
+                    # the indicator back to `thinking`. The reasoning text is still
+                    # surfaced as a chunk; only the coarse phase latches. The tracker
+                    # resets at the tool-call boundary, so the next turn thinks afresh.
+                    if streamed_phase != "responding":
+                        _phase("thinking")
                     yield StreamChunk(content=event.data.delta, type="thinking")
 
             elif isinstance(event, RunItemStreamEvent):
@@ -215,6 +249,10 @@ class OrchestratorAgent:
                         tool_args=args,
                         tool_call_id=call_id,
                     )
+                    # The hook moves us to `calling_tool`; clear the tracker so the
+                    # next turn's first delta re-emits its phase (a turn that resumes
+                    # straight into content would otherwise be missed as stale).
+                    streamed_phase = ""
                 elif isinstance(item, ToolCallOutputItem):
                     raw = item.raw_item
                     call_id = (
@@ -228,9 +266,14 @@ class OrchestratorAgent:
                         tool_call_id=call_id,
                     )
                 elif isinstance(item, ReasoningItem):
-                    text = "".join(
-                        c.text for c in (item.raw_item.content or []) if hasattr(c, "text")
-                    )
+                    raw = item.raw_item
+                    # Prefer the detailed `content`; fall back to `summary`, where
+                    # o-series and many OpenAI-compatible backends put reasoning while
+                    # leaving `content` empty (the empty-reasoning bug). Mirrors the
+                    # dual-channel handling of the streamed reasoning deltas above.
+                    text = "".join(c.text for c in (raw.content or []) if hasattr(c, "text"))
+                    if not text:
+                        text = "".join(s.text for s in (raw.summary or []) if hasattr(s, "text"))
                     if text:
                         yield StreamChunk(content=text, type="thinking_done")
                 elif isinstance(item, MessageOutputItem):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from rich.console import Group
 from rich.live import Live
@@ -11,6 +12,34 @@ from rich.text import Text
 from comet.display.view import SystemView
 
 _SPINNER_FRAMES = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]
+
+
+def format_duration(seconds: float) -> str:
+    """Human-readable elapsed time with rollover: ``45s`` → ``1m 23s`` → ``1h 05m``.
+
+    Used for the settled per-turn usage summary; see `format_clock` for the
+    live ticking variant."""
+    total = int(seconds)
+    if total < 60:
+        return f"{total}s"
+    m, s = divmod(total, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
+
+
+def format_clock(seconds: float) -> str:
+    """Fixed-width ticking clock for the live panel: ``00:42`` → ``1:05:03``.
+
+    Rolls over into an hours field past 60 minutes; the leading ``mm:ss`` stays
+    zero-padded so the panel title doesn't jitter as it ticks."""
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 
 class LiveDisplay:
@@ -24,21 +53,28 @@ class LiveDisplay:
     def __init__(self, view: SystemView) -> None:
         self._view = view
         self._frame = 0
+        self._start = time.perf_counter()  # for the live elapsed clock in the title
         self._live = Live(auto_refresh=False, transient=False)
         self._task: asyncio.Task[None] | None = None
 
     def _render_orchestrator(self) -> Panel:
         orch = self._view.orchestrator
-        reasoning = orch.reasoning_effort or "-"
         tool = orch.current_tool or "-"
         turns = orch.turns
+        active = orch.phase != "idle"
+        phase_label = {
+            "waiting": "Waiting",
+            "thinking": "Thinking",
+            "responding": "Responding",
+            "calling_tool": "Calling tool",
+            "idle": "Idle",
+        }.get(orch.phase, orch.phase)
 
-        spinner = _SPINNER_FRAMES[self._frame % len(_SPINNER_FRAMES)] if orch.is_thinking else " "
+        spinner = _SPINNER_FRAMES[self._frame % len(_SPINNER_FRAMES)] if active else " "
 
         stats = Text()
-        stats.append(f"{spinner} ", style="yellow" if orch.is_thinking else "dim")
-        stats.append("Reasoning: ", style="dim")
-        stats.append(str(reasoning))
+        stats.append(f"{spinner} ", style="yellow" if active else "dim")
+        stats.append(phase_label, style="yellow" if active else "dim")
         stats.append("    Turns: ", style="dim")
         stats.append(str(turns))
         stats.append("    Tool: ", style="dim")
@@ -58,9 +94,21 @@ class LiveDisplay:
             status_line.append(orch.status, style="italic")
             lines.append(status_line)
 
+        u = self._view.usage
+        if u.runs:
+            usage_line = Text("\n")
+            usage_line.append("Tokens: ", style="dim")
+            usage_line.append(f"{u.total_tokens:,}")
+            usage_line.append(f" (in {u.input_tokens:,} / out {u.output_tokens:,})", style="dim")
+            usage_line.append("    Reqs: ", style="dim")
+            usage_line.append(str(u.requests))
+            lines.append(usage_line)
+
         content: Text | object = Text.assemble(*lines)
 
-        return Panel(content, title="Orchestrator", border_style="dim")
+        clock = format_clock(time.perf_counter() - self._start)
+        title = Text.assemble(Text("Orchestrator"), Text(f"  ·  {clock}", style="dim"))
+        return Panel(content, title=title, border_style="dim")
 
     def _render_subagents(self) -> Panel:
         entries = self._view.subagent_list()

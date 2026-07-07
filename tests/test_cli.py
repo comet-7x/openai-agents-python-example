@@ -7,7 +7,26 @@ from __future__ import annotations
 import httpx
 from comet import cli
 from comet.agents.stream import StreamChunk
+from comet.display.display import format_clock, format_duration
 from comet.display.view import SystemView
+
+
+def test_format_duration_rolls_over() -> None:
+    # Settled per-turn summary: seconds → minutes → hours, no fractional seconds.
+    assert format_duration(0) == "0s"
+    assert format_duration(45.7) == "45s"
+    assert format_duration(83) == "1m 23s"
+    assert format_duration(600) == "10m 00s"
+    assert format_duration(3723) == "1h 02m"
+
+
+def test_format_clock_is_fixed_width() -> None:
+    # Live ticking clock: zero-padded mm:ss so the panel title doesn't jitter,
+    # rolling into an hours field past 60 minutes.
+    assert format_clock(0) == "00:00"
+    assert format_clock(9) == "00:09"
+    assert format_clock(83) == "01:23"
+    assert format_clock(3723) == "1:02:03"
 
 
 class _RaisingOrchestrator:

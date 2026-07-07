@@ -5,8 +5,10 @@ coroutine to wrap with `agents.function_tool`. Paths are resolved relative to
 `ctx.workspace_dir` and confined to it, so a tool call cannot read or write
 outside the agent's sandbox.
 
-Not yet wired into the default worker toolset — established here so Phase 2 can
-opt agents into them without another refactor.
+Wired into the default worker toolset (`agents/worker.py`) alongside the shell,
+sharing its `ToolContext` so all four tools resolve paths against the same
+session workspace. Reads are workspace-confined (unlike the shell, which may read
+system files) — these tools are for workspace files, not arbitrary host paths.
 """
 
 from __future__ import annotations

@@ -1,4 +1,5 @@
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from comet.message_bus import events as ev
 from comet.message_bus.bus import MessageBus
 from comet.tools.bash import make_shell_tool
 from comet.tools.context import ToolContext
+from comet.tools.filesystem import make_edit_tool, make_read_tool, make_write_tool
 
 _WORKSPACES_ROOT = config.WORKSPACES_ROOT
 
@@ -38,6 +40,10 @@ unless it is unchanged from the previous call.
 
 ## Execution
 - Use the shell tool to write, run, and iterate on code.
+- For files in your workspace, prefer the dedicated file tools over shell heredocs / `echo >`: \
+`write_file(path, content)` (creates parent dirs, overwrites), `read_file(path)`, and \
+`edit_file(path, old, new)` (replaces one unique occurrence). They avoid quoting/escaping \
+pitfalls. Keep using the shell for running code, installs, and pipelines.
 - Prefer selectively viewing files (with `head` or `tail`) vs `cat` to save time and bandwidth.
 - Prefer redirecting output to files or piping between commands, rather than viewing the output.
 - Apply reasonable timeouts via shell constructs (e.g. `timeout 30 <cmd>`) to avoid hanging.
@@ -109,9 +115,11 @@ class WorkerAgent:
             self.last_command = cmd
             self._bus.publish(ev.SubagentCommand(id=self.id, command=cmd))
 
-        shell = make_shell_tool(
-            ToolContext(workspace_dir=self.workspace_dir, on_command=_record_command)
-        )
+        ctx = ToolContext(workspace_dir=self.workspace_dir, on_command=_record_command)
+        shell = make_shell_tool(ctx)
+        read_file = make_read_tool(ctx)
+        write_file = make_write_tool(ctx)
+        edit_file = make_edit_tool(ctx)
 
         hooks.bind(self)  # bind before passing so the agent sees the ref immediately
         self.agent = Agent(
@@ -126,14 +134,23 @@ class WorkerAgent:
                 f"persists across turns: files here (e.g. an earlier report) may already "
                 f"exist for you to read or modify, and what you write is visible to others. "
                 f"Check for existing files before assuming a clean slate; use distinct "
-                f"filenames for your own intermediate scratch to avoid clobbering siblings."
+                f"filenames for your own intermediate scratch to avoid clobbering siblings.\n"
+                f"Keep everything you create - deliverables and scratch alike - inside this "
+                f"directory. Don't cd out of it, redirect output to paths outside it, or rm "
+                f"paths outside it; such commands are blocked. (Reading system files and "
+                f"installing packages or cloning repos is fine.)"
             ),
             tools=[
                 function_tool(set_status),
                 function_tool(shell),
+                function_tool(read_file),
+                function_tool(write_file),
+                function_tool(edit_file),
                 *(extra_tools or []),
             ],
-            model_settings=ModelSettings(tool_choice="required"),
+            # include_usage=True so token counts arrive even with a custom
+            # LLM_BASE_URL (see the note in orchestrator.py).
+            model_settings=ModelSettings(tool_choice="required", include_usage=True),
             hooks=hooks,
         )
 
@@ -162,6 +179,7 @@ class WorkerAgent:
 
     async def run(self, prompt: str) -> None:
         """Start a background task to run the worker agent (non-blocking)."""
+        start = time.perf_counter()
         self.run_task = asyncio.create_task(
             Runner.run(
                 self.agent,
@@ -175,7 +193,15 @@ class WorkerAgent:
         def _on_done(task: asyncio.Task[Any]) -> None:
             if task.cancelled():
                 return
-            state = "error" if task.exception() is not None else "done"
+            exc = task.exception()
+            state = "error" if exc is not None else "done"
             self._bus.publish(ev.SubagentState(id=self.id, state=state))
+            # On success, read token counts off the RunResult. On error there is
+            # no result to read (task.result() would re-raise), so usage=None →
+            # zero tokens; we still report the elapsed time so the run is counted.
+            usage = task.result().context_wrapper.usage if exc is None else None
+            self._bus.publish(
+                ev.UsageReported.from_usage(self.id, usage, time.perf_counter() - start)
+            )
 
         self.run_task.add_done_callback(_on_done)
