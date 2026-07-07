@@ -87,7 +87,7 @@ def add_runs_with_bold(paragraph, text, cjk_font, latin_font=None, italic=False,
     last_index = 0
     for m in BOLD_RE.finditer(text):
         if m.start() > last_index:
-            run = paragraph.add_run(text[last_index:m.start()])
+            run = paragraph.add_run(text[last_index : m.start()])
             set_run_font(run, cjk_font, latin_font)
             run.italic = italic
             if size:
@@ -123,11 +123,14 @@ def split_table_row(line):
 
 def shade_cell(cell, fill_hex="D9E2F3"):
     tc_pr = cell._tc.get_or_add_tcPr()
-    shd = tc_pr.makeelement(qn("w:shd"), {
-        qn("w:val"): "clear",
-        qn("w:color"): "auto",
-        qn("w:fill"): fill_hex,
-    })
+    shd = tc_pr.makeelement(
+        qn("w:shd"),
+        {
+            qn("w:val"): "clear",
+            qn("w:color"): "auto",
+            qn("w:fill"): fill_hex,
+        },
+    )
     tc_pr.append(shd)
 
 
@@ -205,8 +208,8 @@ def convert(md_text, cjk_font, latin_font=None):
 
     # base style font
     style = doc.styles["Normal"]
-    style.font.name = latin_font or cjk_font # type: ignore
-    style.font.size = Pt(10.5) # type: ignore
+    style.font.name = latin_font or cjk_font  # type: ignore
+    style.font.size = Pt(10.5)  # type: ignore
     rpr = style.element.get_or_add_rPr()
     rfonts = rpr.find(qn("w:rFonts"))
     if rfonts is None:
@@ -334,9 +337,18 @@ def export_pdf(docx_path):
     profile = tempfile.mkdtemp(prefix="lo_profile_")
     try:
         subprocess.run(  # noqa: S603 — fixed argv (no shell=True); inputs are our own paths
-            [soffice, f"-env:UserInstallation=file://{profile}", "--headless",
-             "--convert-to", "pdf", "--outdir", str(docx_path.parent), str(docx_path)],
-            check=True, capture_output=True,
+            [
+                soffice,
+                f"-env:UserInstallation=file://{profile}",
+                "--headless",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                str(docx_path.parent),
+                str(docx_path),
+            ],
+            check=True,
+            capture_output=True,
         )
     except subprocess.CalledProcessError as e:
         print(f"PDF export failed: {e.stderr.decode('utf-8', 'replace').strip()}")
@@ -366,7 +378,8 @@ def render_previews(pdf_path, pages, dpi=100):
     try:
         subprocess.run(  # noqa: S603 — fixed argv (no shell=True); inputs are our own paths
             [pdftoppm, "-png", "-r", str(dpi), "-l", str(pages), str(pdf_path), str(prefix)],
-            check=True, capture_output=True,
+            check=True,
+            capture_output=True,
         )
     except subprocess.CalledProcessError as e:
         print(f"Preview failed: {e.stderr.decode('utf-8', 'replace').strip()}")
@@ -381,18 +394,33 @@ def main():
     parser = argparse.ArgumentParser(description="Convert a knowledge-map markdown file to .docx")
     parser.add_argument("input", help="Path to input .md file")
     parser.add_argument("output", help="Path to output .docx file")
-    parser.add_argument("--cjk-font", default="Microsoft YaHei",
-                         help="Font for Chinese/CJK characters (default: Microsoft YaHei)")
-    parser.add_argument("--latin-font", default="Calibri",
-                         help="Font for Latin characters/numbers (default: Calibri). "
-                              "Pass the same value as --cjk-font for single-font mode.")
-    parser.add_argument("--pdf", action="store_true",
-                         help="Also export a .pdf next to the .docx (via LibreOffice/soffice).")
-    parser.add_argument("--preview", type=int, default=0, metavar="N",
-                         help="Render the first N pages of the PDF to PNG previews for a "
-                              "visual spot-check (implies --pdf). 0 = none (default).")
-    parser.add_argument("--dpi", type=int, default=100,
-                         help="Resolution for --preview PNGs (default: 100).")
+    parser.add_argument(
+        "--cjk-font",
+        default="Microsoft YaHei",
+        help="Font for Chinese/CJK characters (default: Microsoft YaHei)",
+    )
+    parser.add_argument(
+        "--latin-font",
+        default="Calibri",
+        help="Font for Latin characters/numbers (default: Calibri). "
+        "Pass the same value as --cjk-font for single-font mode.",
+    )
+    parser.add_argument(
+        "--pdf",
+        action="store_true",
+        help="Also export a .pdf next to the .docx (via LibreOffice/soffice).",
+    )
+    parser.add_argument(
+        "--preview",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Render the first N pages of the PDF to PNG previews for a "
+        "visual spot-check (implies --pdf). 0 = none (default).",
+    )
+    parser.add_argument(
+        "--dpi", type=int, default=100, help="Resolution for --preview PNGs (default: 100)."
+    )
     args = parser.parse_args()
 
     with open(args.input, encoding="utf-8") as f:
@@ -400,7 +428,9 @@ def main():
 
     doc = convert(md_text, args.cjk_font, args.latin_font)
     doc.save(args.output)
-    print(f"Converted {args.input} -> {args.output} (cjk: {args.cjk_font}, latin: {args.latin_font})")
+    print(
+        f"Converted {args.input} -> {args.output} (cjk: {args.cjk_font}, latin: {args.latin_font})"
+    )
 
     if args.pdf or args.preview:
         pdf_path = export_pdf(args.output)

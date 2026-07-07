@@ -61,10 +61,26 @@ def test_systemview_reduces_events() -> None:
 
 def test_systemview_sums_usage() -> None:
     view = SystemView()
-    view.apply(ev.UsageReported(source="orchestrator", requests=2, input_tokens=100,
-                                output_tokens=40, total_tokens=140, elapsed_s=1.5))
-    view.apply(ev.UsageReported(source="s1", requests=1, input_tokens=30,
-                                output_tokens=10, total_tokens=40, elapsed_s=0.5))
+    view.apply(
+        ev.UsageReported(
+            source="orchestrator",
+            requests=2,
+            input_tokens=100,
+            output_tokens=40,
+            total_tokens=140,
+            elapsed_s=1.5,
+        )
+    )
+    view.apply(
+        ev.UsageReported(
+            source="s1",
+            requests=1,
+            input_tokens=30,
+            output_tokens=10,
+            total_tokens=40,
+            elapsed_s=0.5,
+        )
+    )
     u = view.usage
     assert (u.requests, u.input_tokens, u.output_tokens, u.total_tokens) == (3, 130, 50, 180)
     assert u.runs == 2

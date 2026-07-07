@@ -120,9 +120,7 @@ class OrchestratorAgent:
 
         # One workspace per session, shared by all subagents so their files
         # (reports, data) are visible to each other and persist across turns.
-        self.session_id = session_id or datetime.now(config.TIMEZONE).strftime(
-            "sess_%Y%m%d_%H%M%S"
-        )
+        self.session_id = session_id or datetime.now(config.TIMEZONE).strftime("sess_%Y%m%d_%H%M%S")
         self.session_workspace = config.WORKSPACES_ROOT / self.session_id
         self.session_workspace.mkdir(parents=True, exist_ok=True)
 
