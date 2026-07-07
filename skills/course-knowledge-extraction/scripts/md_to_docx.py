@@ -27,16 +27,25 @@ Wide tables (6+ columns, e.g. the knowledge-point overview table) get a
 smaller font and tighter row spacing automatically so they stay readable
 without wrapping every cell into a wall of text.
 
+Optionally also exports a PDF (via LibreOffice/soffice) and PNG page previews
+(via pdftoppm) so one call can produce docx + pdf + a visual spot-check.
+
 Usage:
     python md_to_docx.py <input.md> <output.docx> \
-        [--cjk-font "Microsoft YaHei"] [--latin-font "Calibri"]
+        [--cjk-font "Microsoft YaHei"] [--latin-font "Calibri"] \
+        [--pdf] [--preview N] [--dpi 100]
 
 Requires the `python-docx` package (`uv add python-docx`, or `pip install python-docx`
-if running outside uv).
+if running outside uv). --pdf needs `soffice`/`libreoffice` on PATH; --preview also
+needs `pdftoppm` (poppler). Both degrade gracefully with a note if the tool is absent.
 """
 
 import argparse
 import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 
 from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
@@ -310,6 +319,64 @@ def convert(md_text, cjk_font, latin_font=None):
     return doc
 
 
+def export_pdf(docx_path):
+    """Convert a .docx to .pdf in the same directory via LibreOffice (soffice).
+
+    Returns the PDF path, or None if soffice/libreoffice isn't on PATH (in which
+    case a note is printed and the .docx is left as the only output). Each call
+    uses a throwaway LibreOffice profile so parallel conversions don't collide on
+    the shared profile lock."""
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        print("PDF export skipped: soffice/libreoffice not found on PATH.")
+        return None
+    docx_path = Path(docx_path)
+    profile = tempfile.mkdtemp(prefix="lo_profile_")
+    try:
+        subprocess.run(  # noqa: S603 — fixed argv (no shell=True); inputs are our own paths
+            [soffice, f"-env:UserInstallation=file://{profile}", "--headless",
+             "--convert-to", "pdf", "--outdir", str(docx_path.parent), str(docx_path)],
+            check=True, capture_output=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"PDF export failed: {e.stderr.decode('utf-8', 'replace').strip()}")
+        return None
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
+    pdf_path = docx_path.with_suffix(".pdf")
+    if pdf_path.exists():
+        print(f"Exported PDF -> {pdf_path}")
+        return pdf_path
+    print("PDF export failed: soffice ran but produced no PDF.")
+    return None
+
+
+def render_previews(pdf_path, pages, dpi=100):
+    """Render the first `pages` pages of a PDF to PNGs via pdftoppm, for a quick
+    visual spot-check. Returns the list of PNG paths (empty if pdftoppm is
+    unavailable or `pages` < 1). Files are named <pdf-stem>_preview-N.png."""
+    if not pdf_path or pages < 1:
+        return []
+    pdftoppm = shutil.which("pdftoppm")
+    if not pdftoppm:
+        print("Preview skipped: pdftoppm not found on PATH.")
+        return []
+    pdf_path = Path(pdf_path)
+    prefix = pdf_path.with_name(f"{pdf_path.stem}_preview")
+    try:
+        subprocess.run(  # noqa: S603 — fixed argv (no shell=True); inputs are our own paths
+            [pdftoppm, "-png", "-r", str(dpi), "-l", str(pages), str(pdf_path), str(prefix)],
+            check=True, capture_output=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"Preview failed: {e.stderr.decode('utf-8', 'replace').strip()}")
+        return []
+    pngs = sorted(pdf_path.parent.glob(f"{prefix.name}-*.png"))
+    if pngs:
+        print(f"Rendered {len(pngs)} preview page(s): {', '.join(p.name for p in pngs)}")
+    return pngs
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert a knowledge-map markdown file to .docx")
     parser.add_argument("input", help="Path to input .md file")
@@ -319,6 +386,13 @@ def main():
     parser.add_argument("--latin-font", default="Calibri",
                          help="Font for Latin characters/numbers (default: Calibri). "
                               "Pass the same value as --cjk-font for single-font mode.")
+    parser.add_argument("--pdf", action="store_true",
+                         help="Also export a .pdf next to the .docx (via LibreOffice/soffice).")
+    parser.add_argument("--preview", type=int, default=0, metavar="N",
+                         help="Render the first N pages of the PDF to PNG previews for a "
+                              "visual spot-check (implies --pdf). 0 = none (default).")
+    parser.add_argument("--dpi", type=int, default=100,
+                         help="Resolution for --preview PNGs (default: 100).")
     args = parser.parse_args()
 
     with open(args.input, encoding="utf-8") as f:
@@ -327,6 +401,11 @@ def main():
     doc = convert(md_text, args.cjk_font, args.latin_font)
     doc.save(args.output)
     print(f"Converted {args.input} -> {args.output} (cjk: {args.cjk_font}, latin: {args.latin_font})")
+
+    if args.pdf or args.preview:
+        pdf_path = export_pdf(args.output)
+        if args.preview:
+            render_previews(pdf_path, args.preview, args.dpi)
 
 
 if __name__ == "__main__":

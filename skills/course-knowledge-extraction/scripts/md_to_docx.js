@@ -17,15 +17,23 @@
  * This is NOT a general CommonMark parser — it's intentionally narrow,
  * tuned to this skill's own output shape, so conversion stays predictable.
  *
+ * Optionally also exports a PDF (via LibreOffice/soffice) and PNG page previews
+ * (via pdftoppm) so one call can produce docx + pdf + a visual spot-check.
+ *
  * Usage:
- *   node md_to_docx.js <input.md> <output.docx> [--font "Microsoft YaHei"]
+ *   node md_to_docx.js <input.md> <output.docx> [--font "Microsoft YaHei"] \
+ *       [--pdf] [--preview N] [--dpi 100]
  *
  * Requires the `docx` npm package (already available in this environment's
- * global node_modules; if running elsewhere: npm install docx).
+ * global node_modules; if running elsewhere: npm install docx). --pdf needs
+ * `soffice`/`libreoffice` on PATH; --preview also needs `pdftoppm` (poppler).
+ * Both degrade gracefully with a note if the tool is absent.
  */
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
+const { execFileSync } = require("child_process");
 const {
   Document, Packer, Paragraph, TextRun, HeadingLevel,
   Table, TableRow, TableCell, WidthType, ShadingType,
@@ -33,14 +41,87 @@ const {
 
 function parseArgs(argv) {
   const args = argv.slice(2);
-  const positional = args.filter(a => !a.startsWith("--"));
-  const fontIdx = args.indexOf("--font");
-  const font = fontIdx !== -1 ? args[fontIdx + 1] : "Microsoft YaHei";
+  const opts = { font: "Microsoft YaHei", pdf: false, preview: 0, dpi: 100 };
+  const positional = [];
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k];
+    if (a === "--font") opts.font = args[++k];
+    else if (a === "--pdf") opts.pdf = true;
+    else if (a === "--preview") opts.preview = parseInt(args[++k], 10) || 0;
+    else if (a === "--dpi") opts.dpi = parseInt(args[++k], 10) || 100;
+    else if (a.startsWith("--")) { /* unknown flag: ignore */ }
+    else positional.push(a);
+  }
   if (positional.length < 2) {
-    console.error("Usage: node md_to_docx.js <input.md> <output.docx> [--font \"Font Name\"]");
+    console.error("Usage: node md_to_docx.js <input.md> <output.docx> " +
+                  "[--font \"Font\"] [--pdf] [--preview N] [--dpi 100]");
     process.exit(1);
   }
-  return { input: positional[0], output: positional[1], font };
+  return { input: positional[0], output: positional[1], ...opts };
+}
+
+// Resolve an executable on PATH, or null if it isn't found.
+function which(cmd) {
+  try {
+    const finder = process.platform === "win32" ? "where" : "which";
+    return execFileSync(finder, [cmd], { stdio: ["ignore", "pipe", "ignore"] })
+      .toString().trim().split(/\r?\n/)[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+// Convert a .docx to .pdf in the same dir via LibreOffice. Returns the PDF path
+// or null. Uses a throwaway profile so parallel conversions don't collide on the
+// shared LibreOffice profile lock.
+function exportPdf(docxPath) {
+  const soffice = which("soffice") || which("libreoffice");
+  if (!soffice) {
+    console.error("PDF export skipped: soffice/libreoffice not found on PATH.");
+    return null;
+  }
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "lo_profile_"));
+  try {
+    execFileSync(soffice, [`-env:UserInstallation=file://${profile}`, "--headless",
+      "--convert-to", "pdf", "--outdir", path.dirname(docxPath), docxPath], { stdio: "ignore" });
+  } catch (e) {
+    console.error(`PDF export failed: ${e.message}`);
+    return null;
+  } finally {
+    fs.rmSync(profile, { recursive: true, force: true });
+  }
+  const pdfPath = docxPath.replace(/\.docx$/i, ".pdf");
+  if (fs.existsSync(pdfPath)) {
+    console.log(`Exported PDF -> ${pdfPath}`);
+    return pdfPath;
+  }
+  console.error("PDF export failed: soffice ran but produced no PDF.");
+  return null;
+}
+
+// Render the first `pages` pages of a PDF to PNGs via pdftoppm, for a quick
+// visual spot-check. Returns the PNG filenames (empty if pdftoppm is missing).
+function renderPreviews(pdfPath, pages, dpi) {
+  if (!pdfPath || pages < 1) return [];
+  const pdftoppm = which("pdftoppm");
+  if (!pdftoppm) {
+    console.error("Preview skipped: pdftoppm not found on PATH.");
+    return [];
+  }
+  const dir = path.dirname(pdfPath);
+  const stem = path.basename(pdfPath).replace(/\.pdf$/i, "");
+  const prefix = path.join(dir, `${stem}_preview`);
+  try {
+    execFileSync(pdftoppm, ["-png", "-r", String(dpi), "-l", String(pages), pdfPath, prefix],
+      { stdio: "ignore" });
+  } catch (e) {
+    console.error(`Preview failed: ${e.message}`);
+    return [];
+  }
+  const pngs = fs.readdirSync(dir)
+    .filter(f => f.startsWith(`${stem}_preview-`) && f.endsWith(".png")).sort();
+  if (pngs.length) console.log(`Rendered ${pngs.length} preview page(s): ${pngs.join(", ")}`);
+  return pngs;
 }
 
 // Split a line into runs, handling **bold** spans.
@@ -220,15 +301,24 @@ function convert(mdText, font) {
 }
 
 async function main() {
-  const { input, output, font } = parseArgs(process.argv);
+  const { input, output, font, pdf, preview, dpi } = parseArgs(process.argv);
   const mdText = fs.readFileSync(input, "utf-8");
   const doc = convert(mdText, font);
   const buf = await Packer.toBuffer(doc);
   fs.writeFileSync(output, buf);
   console.log(`Converted ${input} -> ${output} (font: ${font})`);
+
+  if (pdf || preview) {
+    const pdfPath = exportPdf(output);
+    if (preview) renderPreviews(pdfPath, preview, dpi);
+  }
 }
 
-main().catch(err => {
-  console.error("Conversion failed:", err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch(err => {
+    console.error("Conversion failed:", err);
+    process.exit(1);
+  });
+}
+
+module.exports = { parseArgs, which, exportPdf, renderPreviews };
