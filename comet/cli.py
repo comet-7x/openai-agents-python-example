@@ -62,10 +62,10 @@ class StreamUI:
     def __init__(self) -> None:
         self._console = Console(highlight=False)
         self._frame = 0
-        # "Waiting…" = request in flight, no token yet (time-to-first-token); it
+        # "Client…" = request in flight, no token yet (time-to-first-token); it
         # becomes "Reasoning…" if reasoning deltas arrive, or the answer text itself
         # once content streams. Mirrors the OrchestratorPhase waiting/thinking split.
-        self._status_msg = "Waiting…"
+        self._status_msg = "Client…"
         self._pending: dict[str, str] = {}  # call_id → tool_name
         self._last_char = "\n"
         self._text_buf = ""  # partial line shown inside the Live area
@@ -122,7 +122,7 @@ class StreamUI:
                 self._commit_reasoning(self._reasoning_buf)
                 self._thinking = False
                 self._reasoning_buf = ""
-                self._set_waiting()
+            self._set_waiting()
             self._write_text(chunk.content)
 
         elif chunk.type == "thinking":
@@ -133,8 +133,7 @@ class StreamUI:
                 self._thinking = True
                 self._reasoning_buf = ""
             self._reasoning_buf += chunk.content
-            self._status_msg = self._reasoning_status(self._reasoning_buf)
-            self._live.update(self._make_renderable(), refresh=True)
+            self._set_reasoning()
 
         elif chunk.type == "thinking_done":
             # Commit the reasoning as one dim line — but only while still
@@ -169,20 +168,19 @@ class StreamUI:
         return Text(f"{frame} {self._status_msg}", style="yellow dim")
 
     def _set_waiting(self) -> None:
-        """Revert the spinner to the awaiting-next-LLM-output state."""
         self._status_msg = "Waiting…"
         self._live.update(self._make_renderable(), refresh=True)
 
-    def _reasoning_status(self, buf: str) -> str:
-        """Build the live spinner label from the reasoning so far: a single line
-        showing the trailing (most recent) reasoning, so it reads as the model's
-        current thought rather than freezing on the opening sentence."""
-        tail = " ".join(buf.split())  # collapse newlines/runs of whitespace
-        if not tail:
-            return "Reasoning…"
-        if len(tail) > self._REASONING_WIDTH:
-            tail = "…" + tail[-(self._REASONING_WIDTH - 1) :]
-        return f"Reasoning… {tail}"
+    def _set_reasoning(self) -> None:
+        self._status_msg = "Reasoning…"
+        self._live.update(self._make_renderable(), refresh=True)
+
+    def _set_message_done(self) -> None:
+        """Terminal state for a finished turn: the run completed (via finish() or a
+        clean end of stream), so show 'Completed' instead of reverting to
+        'Waiting…' as if another LLM call were imminent."""
+        self._status_msg = "Completed"
+        self._live.update(self._make_renderable(), refresh=True)
 
     def _commit_reasoning(self, text: str) -> None:
         """Print the finished reasoning as one dim line above the Live area — a
@@ -196,10 +194,6 @@ class StreamUI:
         self._flush_text()
         self._live.console.print(f"[dim italic]◌ Reasoning · {line}[/dim italic]")
         self._last_char = "\n"
-
-    def _set_running(self, tool: str) -> None:
-        self._status_msg = f"Running {tool}…"
-        self._live.update(self._make_renderable(), refresh=True)
 
     def _flush_text(self) -> None:
         """Print any remaining buffered text and ensure we end on a new line."""
@@ -270,7 +264,6 @@ class StreamUI:
             if isinstance(summary, str) and summary.strip():
                 self._live.console.print(summary.strip())
                 self._last_char = "\n"
-            self._set_running(tool)
             return
 
         is_status = tool == "set_status"
@@ -291,13 +284,15 @@ class StreamUI:
                 )
             )
 
-        self._set_running(tool)
-
     def _render_tool_output(self, chunk: StreamChunk) -> None:
         call_id = chunk.tool_call_id
         tool_name = self._pending.pop(call_id, None) if call_id else None
 
-        if tool_name in ("set_status", "finish"):
+        if tool_name == "finish":
+            # finish() ends the run (StopAtTools) — this is the turn's completion.
+            self._set_message_done()
+            return
+        if tool_name == "set_status":
             self._set_waiting()
             return
 
@@ -347,8 +342,7 @@ class RobustStreamUI(StreamUI):
                 self._thinking = True
                 self._reasoning_buf = ""
             self._reasoning_buf += chunk.content
-            self._status_msg = self._reasoning_status(self._reasoning_buf)
-            self._live.update(self._make_renderable(), refresh=True)
+            self._set_reasoning()
 
         elif t == "thinking_done":
             # Commit only while still mid-reasoning; a late thinking_done (after
@@ -447,8 +441,9 @@ class StreamDisplay(RobustStreamUI):
         # the Live area. The clock ticks because tick() re-renders this each frame.
         clock = format_clock(time.perf_counter() - self._start)
         title = Text.assemble(
-            Text(f"{frame} ", style="yellow dim"),
-            Text(self._status_msg, style="yellow dim"),
+            Text(f"{frame}  {self._status_msg}", style="yellow dim")
+            if self._status_msg != "Completed"
+            else Text(f"✿  {self._status_msg}", style="blue dim"),
             Text(f"  ·  {clock}", style="dim"),
         )
 
@@ -580,13 +575,16 @@ async def _run_stream(
     with StreamDisplay(view) as ui:
         # Print initial status at the top of the output so the user sees
         # immediate feedback before any tool calls scroll in below.
-        ui._live.console.print(Text("⣾ Waiting…", style="yellow dim"))
+        # ui._live.console.print(Text("Start Working...", style="yellow dim"))
         tasks: list[asyncio.Task[None]] = [asyncio.create_task(_spin(ui))]
         if approval_queue is not None:
             tasks.append(asyncio.create_task(_approval_handler(ui)))
         try:
             async for chunk in orchestrator.run_streamed(prompt):
                 ui.on_chunk(chunk)
+            # Stream drained cleanly — settle the indicator on "Completed" (covers
+            # turns that end without a finish() tool call, e.g. a plain final text).
+            ui._set_message_done()
         except Exception as e:  # one turn's failure must not crash the whole session
             error = e
         finally:
@@ -731,9 +729,13 @@ def _print_usage_summary(
     )
 
 
-def _new_session() -> tuple[OrchestratorAgent, SystemView]:
+def _new_session(session_name: str | None = None) -> tuple[OrchestratorAgent, SystemView]:
     """Compose one session: a bus, a SystemView fed by it, and an orchestrator
-    that publishes to it. Displays render the view; nobody polls the agents."""
+    that publishes to it. Displays render the view; nobody polls the agents.
+
+    `session_name` (from `--session`) names a persistent session whose conversation
+    is file-backed and resumes across restarts; without it the session is anonymous
+    and in-memory."""
     bus = MessageBus()
     view = SystemView()
     bus.subscribe(view.apply)
@@ -741,13 +743,21 @@ def _new_session() -> tuple[OrchestratorAgent, SystemView]:
         logger = JsonlLogger.for_run(config.TRACES_DIR)
         bus.subscribe(logger.handle)
         print(f"trace → {logger.path}", file=sys.stderr)
-    orchestrator = OrchestratorAgent(model=_model, bus=bus)
+    orchestrator = OrchestratorAgent(model=_model, bus=bus, session_id=session_name)
+    if orchestrator.persistent:
+        verb = "resuming" if orchestrator.resuming else "new"
+        print(
+            f"session '{orchestrator.session_id}' ({verb}) → {orchestrator.session_workspace}",
+            file=sys.stderr,
+        )
     return orchestrator, view
 
 
-async def main(prompt: str | None, interactive: bool, stream: bool) -> None:
+async def main(
+    prompt: str | None, interactive: bool, stream: bool, session: str | None = None
+) -> None:
     if prompt is not None:
-        orchestrator, view = _new_session()
+        orchestrator, view = _new_session(session)
         try:
             if stream:
                 await _run_stream(orchestrator, prompt, view)
@@ -766,7 +776,7 @@ async def main(prompt: str | None, interactive: bool, stream: bool) -> None:
         return
 
     if interactive:
-        orchestrator, view = _new_session()
+        orchestrator, view = _new_session(session)
         try:
             if stream:
                 await _interactive_queue_stream(orchestrator, view)
@@ -818,8 +828,16 @@ def run() -> None:
         default=False,
         help="Stream output with live tool-call display.",
     )
+    parser.add_argument(
+        "--session",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help="Named, resumable session: file-backs the conversation under "
+        "workspaces/NAME/ so it survives a restart. Omit for a throwaway in-memory session.",
+    )
     args = parser.parse_args()
-    asyncio.run(main(args.prompt, args.interactive, args.stream))
+    asyncio.run(main(args.prompt, args.interactive, args.stream, args.session))
 
 
 if __name__ == "__main__":

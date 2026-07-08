@@ -41,6 +41,23 @@ class _RaisingOrchestrator:
         raise self._error
 
 
+def test_finish_tool_settles_on_completed() -> None:
+    # finish() ends the run, so its tool_output is the turn's completion — the
+    # indicator must read "Completed", not revert to "Waiting…".
+    ui = cli.RobustStreamUI()
+    ui.on_chunk(
+        StreamChunk(
+            content='{"summary": "done"}',
+            type="tool_call",
+            tool_name="finish",
+            tool_args={"summary": "done"},
+            tool_call_id="c1",
+        )
+    )
+    ui.on_chunk(StreamChunk(content="done", type="tool_output", tool_call_id="c1"))
+    assert ui._status_msg == "Completed"
+
+
 async def test_run_stream_survives_midstream_timeout() -> None:
     # A ReadTimeout mid-stream must be swallowed so the REPL loop keeps going.
     orch = _RaisingOrchestrator(httpx.ReadTimeout("backend went silent"))

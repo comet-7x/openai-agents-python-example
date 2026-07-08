@@ -58,6 +58,36 @@ async def test_shared_session_workspace(model, monkeypatch, tmp_path) -> None:
     orch._session.close()
 
 
+async def test_anonymous_session_is_in_memory(model, monkeypatch, tmp_path) -> None:
+    # No session_id (no --session) → ephemeral: no on-disk db, nothing to resume.
+    monkeypatch.setattr(config, "WORKSPACES_ROOT", tmp_path)
+    orch = OrchestratorAgent(model=model)
+    assert orch.persistent is False
+    assert orch.resuming is False
+    assert not (orch.session_workspace / "session.db").exists()
+    orch._session.close()
+
+
+async def test_named_session_persists_and_resumes(model, monkeypatch, tmp_path) -> None:
+    # A named session file-backs its conversation; re-opening the same name resumes it.
+    monkeypatch.setattr(config, "WORKSPACES_ROOT", tmp_path)
+
+    first = OrchestratorAgent(model=model, session_id="proj")
+    assert first.persistent is True
+    assert first.resuming is False  # brand new — no prior db
+    db = first.session_workspace / "session.db"
+    assert db.exists()  # SQLiteSession created the file
+    # Persist a message so there is history to resume, then close the connection.
+    await first._session.add_items([{"role": "user", "content": "remember me"}])
+    first._session.close()
+
+    second = OrchestratorAgent(model=model, session_id="proj")
+    assert second.resuming is True  # same name, db already on disk
+    items = await second._session.get_items()
+    assert any(i.get("content") == "remember me" for i in items)  # history survived
+    second._session.close()
+
+
 async def test_orchestrator_phase_transitions(model, monkeypatch, tmp_path) -> None:
     # Coarse phase from the lifecycle hooks (the only signal the non-streamed path
     # gets): idle -> waiting (new turn, awaiting first token) -> calling_tool -> idle.
@@ -118,6 +148,10 @@ async def test_streamed_phase_refinement(model, monkeypatch, tmp_path) -> None:
     events = [rreason("t"), rtext("a"), rreason("t2"), rtext("a2"), rtool(), rtext("b")]
 
     class _FakeStreaming:
+        # Mirrors RunResultStreaming: usage is read off context_wrapper once the
+        # stream drains (orchestrator publishes UsageReported from it).
+        context_wrapper = SimpleNamespace(usage=None)
+
         def stream_events(self):
             async def gen():
                 for e in events:
@@ -156,6 +190,8 @@ async def test_streamed_reasoning_summary_channel(model, monkeypatch, tmp_path) 
     events = [rsummary("plan"), rsummary(" more"), reasoning_item("plan more done")]
 
     class _FakeStreaming:
+        context_wrapper = SimpleNamespace(usage=None)
+
         def stream_events(self):
             async def gen():
                 for e in events:
@@ -173,6 +209,51 @@ async def test_streamed_reasoning_summary_channel(model, monkeypatch, tmp_path) 
     orch._session.close()
 
 
+async def test_streamed_reports_usage(model, monkeypatch, tmp_path) -> None:
+    # Once the stream drains, the orchestrator publishes its own UsageReported
+    # (read off context_wrapper.usage) so it's counted in the session total —
+    # otherwise an orchestrator-only turn shows all-zero tokens in the view.
+    monkeypatch.setattr(config, "WORKSPACES_ROOT", tmp_path)
+    bus = MessageBus()
+    view = SystemView()
+    bus.subscribe(view.apply)
+    orch = OrchestratorAgent(model=model, bus=bus)
+
+    usage = SimpleNamespace(requests=1, input_tokens=10, output_tokens=5, total_tokens=15)
+
+    class _FakeStreaming:
+        context_wrapper = SimpleNamespace(usage=usage)
+
+        def stream_events(self):
+            async def gen():
+                for e in ():  # no stream events — we only exercise the drain/report
+                    yield e
+
+            return gen()
+
+    with patch.object(Runner, "run_streamed", return_value=_FakeStreaming()):
+        async for _ in orch.run_streamed("hi"):
+            pass
+
+    assert view.usage.total_tokens == 15
+    assert view.usage.input_tokens == 10
+    assert view.usage.requests == 1
+    orch._session.close()
+
+
 def test_skills_discovered() -> None:
     names = {s.name for s in SkillsRegistry(config.SKILLS_DIR).list_skills()}
     assert "xlsx" in names
+
+
+async def test_prompt_inlines_skill_metadata(model, monkeypatch, tmp_path) -> None:
+    # Level-1 skill metadata (name + description) is baked into the system prompt
+    # each turn, so the orchestrator knows what exists without a list_skills call.
+    monkeypatch.setattr(config, "WORKSPACES_ROOT", tmp_path)
+    orch = OrchestratorAgent(model=model)
+
+    prompt = orch._build_instructions(None, None)
+    for skill in orch._skills.list_skills():
+        assert f"- {skill.name}: {skill.description}" in prompt
+    assert "xlsx" in prompt  # the discovered library is present, not a placeholder
+    orch._session.close()

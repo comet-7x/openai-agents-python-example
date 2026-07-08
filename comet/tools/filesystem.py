@@ -13,6 +13,7 @@ system files) — these tools are for workspace files, not arbitrary host paths.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from comet.tools.context import ToolContext
@@ -38,7 +39,10 @@ def make_read_tool(ctx: ToolContext):
             return f"Error: {e}"
         if not target.is_file():
             return f"Error: file not found: {path}"
-        text = target.read_text(encoding="utf-8", errors="replace")
+        # to_thread: this tool is async, so it's awaited inline on the event loop;
+        # offloading the size-proportional disk read keeps it from blocking sibling
+        # subagents' concurrent turns (see agents/tool.py's sync-vs-async dispatch).
+        text = await asyncio.to_thread(target.read_text, encoding="utf-8", errors="replace")
         if len(text) > _READ_LIMIT:
             return text[:_READ_LIMIT] + f"\n[… {len(text) - _READ_LIMIT} chars truncated]"
         return text
@@ -55,7 +59,7 @@ def make_write_tool(ctx: ToolContext):
         except ValueError as e:
             return f"Error: {e}"
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        await asyncio.to_thread(target.write_text, content, encoding="utf-8")
         return f"Wrote {len(content)} chars to {path}"
 
     return write_file
@@ -71,13 +75,13 @@ def make_edit_tool(ctx: ToolContext):
             return f"Error: {e}"
         if not target.is_file():
             return f"Error: file not found: {path}"
-        text = target.read_text(encoding="utf-8")
+        text = await asyncio.to_thread(target.read_text, encoding="utf-8")
         count = text.count(old)
         if count == 0:
             return "Error: `old` string not found."
         if count > 1:
             return f"Error: `old` string is not unique ({count} matches)."
-        target.write_text(text.replace(old, new, 1), encoding="utf-8")
+        await asyncio.to_thread(target.write_text, text.replace(old, new, 1), encoding="utf-8")
         return f"Edited {path}"
 
     return edit_file

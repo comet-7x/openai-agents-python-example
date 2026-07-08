@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from collections.abc import AsyncGenerator
 from datetime import datetime
 from typing import Any
@@ -61,20 +62,24 @@ Before every tool call, call set_status with a one-sentence description of what 
 unless status is unchanged. One sentence, no filler.
 
 ## Skills
-Start each session by calling list_skills and loading any that are relevant.
-Skills contain detailed operational guidance - follow them closely.
+These skills are available (name - one-line description):
+{skills}
+When a task matches one, call load_skill(name) to pull in its full operational
+guidance, then follow it closely. (list_skills re-lists the same set at any time.)
 Some skills bundle reference docs or scripts - use list_skill_resources and
 read_skill_reference to pull those in only when you actually need them; hand
 script paths to a worker agent's shell tool to run them.
 """
 
 
-def _orchestrator_instructions(_ctx: Any, _agent: Any) -> str:
-    """Build the system prompt, rebuilt per turn so the embedded timestamp stays
-    current across a long interactive session (a plain formatted string would
-    freeze at construction time). The SDK invokes this on every run."""
-    now = datetime.now(config.TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %A")
-    return ORCHESTRATOR_INSTRUCTIONS.format(time=now)
+def _format_skills(skills: list[Any]) -> str:
+    """Level-1 (METADATA) skills overview: one `- name: description` line per
+    skill. Shared by the system prompt (so the orchestrator always *knows* which
+    skills exist, no discovery tool-call required) and the list_skills tool (which
+    just re-lists on demand)."""
+    if not skills:
+        return "(none available)"
+    return "\n".join(f"- {skill.name}: {skill.description}" for skill in skills)
 
 
 class OrchestratorHooks(AgentHooks):  # type: ignore[type-arg]
@@ -124,6 +129,14 @@ class OrchestratorAgent:
         self.session_workspace = config.WORKSPACES_ROOT / self.session_id
         self.session_workspace.mkdir(parents=True, exist_ok=True)
 
+        # A *named* session (session_id given, i.e. `--session NAME`) persists its
+        # conversation to a SQLite file in the workspace, so `run()` resumes it after a
+        # restart; an anonymous (timestamped) session stays in-memory and is discarded
+        # on exit. `resuming` is true only when that file already exists from a prior run.
+        self.persistent = session_id is not None
+        _db_file = self.session_workspace / "session.db"
+        self.resuming = self.persistent and _db_file.exists()
+
         self._pool = WorkerAgentPool(
             model=model, bus=self._bus, session_workspace=self.session_workspace
         )
@@ -142,8 +155,11 @@ class OrchestratorAgent:
         self._agent = Agent(
             name="Orchestrator Agent",
             model=model,
-            instructions=_orchestrator_instructions,
-            model_settings=ModelSettings(tool_choice="auto"),
+            instructions=self._build_instructions,
+            # include_usage=True so token counts arrive even with a custom
+            # LLM_BASE_URL: the SDK only sets stream_options={"include_usage": True}
+            # by default for the official OpenAI client, else streams zero usage.
+            model_settings=ModelSettings(tool_choice="auto", include_usage=True),
             tool_use_behavior=StopAtTools(stop_at_tool_names=["finish"]),
             hooks=orchestrator_hooks,
             tools=[
@@ -162,7 +178,22 @@ class OrchestratorAgent:
                 function_tool(self.finish),
             ],
         )
-        self._session = SQLiteSession(session_id="orchestrator")
+        self._session = SQLiteSession(
+            session_id="orchestrator",
+            db_path=str(_db_file) if self.persistent else ":memory:",
+        )
+
+    def _build_instructions(self, _ctx: Any, _agent: Any) -> str:
+        """Build the system prompt fresh each turn (the SDK invokes this per run).
+
+        Rebuilding matters twice over: the embedded timestamp stays current across
+        a long interactive session, and the Level-1 skills overview reflects the
+        live registry — so the orchestrator always knows which skills exist without
+        first spending a list_skills tool-call to discover them."""
+        now = datetime.now(config.TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %A")
+        return ORCHESTRATOR_INSTRUCTIONS.format(
+            time=now, skills=_format_skills(self._skills.list_skills())
+        )
 
     async def run(self, prompt: str) -> str:
         """Run a single turn with the orchestrator.
@@ -170,11 +201,17 @@ class OrchestratorAgent:
         Emits events on `self._bus`; attaching a live display is the caller's job
         (see cli.py). The orchestrator no longer knows about any display.
         """
+        start = time.perf_counter()
         result = await Runner.run(
             self._agent,
             prompt,
             max_turns=200,
             session=self._session,
+        )
+        self._bus.publish(
+            ev.UsageReported.from_usage(
+                "orchestrator", result.context_wrapper.usage, time.perf_counter() - start
+            )
         )
         return result.final_output or ""
 
@@ -185,6 +222,7 @@ class OrchestratorAgent:
         and receives tool results. The final summary arrives as a tool_call
         chunk with tool_name="finish".
         """
+        start = time.perf_counter()
         streaming = Runner.run_streamed(
             self._agent,
             prompt,
@@ -279,6 +317,15 @@ class OrchestratorAgent:
                     if text:
                         yield StreamChunk(content=text, type="message_done")
 
+        # Stream drained — publish the run's token usage (from context_wrapper,
+        # populated once the stream completes) so the orchestrator is counted in
+        # the session total, mirroring each subagent's _on_done report.
+        self._bus.publish(
+            ev.UsageReported.from_usage(
+                "orchestrator", streaming.context_wrapper.usage, time.perf_counter() - start
+            )
+        )
+
     ## Tools
     def set_status(self, status: str) -> str:
         """Set a one-sentence status summary shown in the live display.
@@ -288,12 +335,9 @@ class OrchestratorAgent:
         return "Status updated."
 
     def list_skills(self) -> str:
-        """List all skills available to the orchestrator, with a one-line description each.
-        Call this at the start of a session before deciding which skills to load."""
-        skills = self._skills.list_skills()
-        if not skills:
-            return "No skills available."
-        return "\n".join(f"- {skill.name}: {skill.description}" for skill in skills)
+        """Re-list the skills available to the orchestrator, one-line description each.
+        The same set is already inlined in the system prompt; call this to refresh it."""
+        return _format_skills(self._skills.list_skills())
 
     def load_skill(self, skill_name: str) -> str:
         """Load a skill's full instructions into context. Call after list_skills
