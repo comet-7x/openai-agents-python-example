@@ -29,6 +29,24 @@ def test_format_clock_is_fixed_width() -> None:
     assert format_clock(3723) == "1:02:03"
 
 
+def test_model_concurrency_is_wired_from_config() -> None:
+    # LLM_MAX_CONCURRENCY must actually gate the shared model's semaphore — an
+    # unwired default (100) lets N subagents + the orchestrator flood a limited
+    # backend, which stalls the last request with no visible progress.
+    from comet import config
+
+    assert cli._model._semaphore._value == config.LLM_MAX_CONCURRENCY
+
+
+def test_session_flag_default_convention() -> None:
+    # Omitted → None (anonymous/in-memory); bare --session → "default"; with a
+    # value → that value. The bare form is the convention this test locks in.
+    p = cli._build_parser()
+    assert p.parse_args([]).session is None
+    assert p.parse_args(["--session"]).session == "default"
+    assert p.parse_args(["--session", "proj"]).session == "proj"
+
+
 class _RaisingOrchestrator:
     """Stands in for OrchestratorAgent: streams a chunk, then fails like a stalled
     backend (the real crash was an httpx.ReadTimeout from run_streamed)."""
