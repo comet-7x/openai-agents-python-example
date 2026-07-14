@@ -1,6 +1,19 @@
 ---
 name: course-knowledge-extraction
-description: "Use when the user provides course material — teaching syllabi (教学大纲), lecture notes, transcripts, articles — and wants it summarized, organized, or turned into study notes or a knowledge base. Triggers: 'course notes', 'lecture notes', 'study guide', 'syllabus', '教学大纲', '知识点', '知识库', 'knowledge map', 'summarize this course', 'extract key concepts', or any text-based educational content wanting a structured breakdown. Produces, for a syllabus, a student-facing knowledge map and a readable knowledge-point deep-dive (both with matching .docx) plus a machine-readable knowledge base; for lecture content, a concept-and-example study outline. Preserves source language unless translation is requested. Not for one-line document questions or quick answers."
+description: "Use when the user provides course material — teaching syllabi (教学大纲), lecture notes, transcripts, articles — and wants it summarized, organized, or turned into study notes or a knowledge base. Accepts the material as pasted text, Markdown, or a .docx/.pdf syllabus (converted to Markdown first via a bundled script). Triggers: 'course notes', 'lecture notes', 'study guide', 'syllabus', '教学大纲', '知识点', '知识库', 'knowledge map', 'summarize this course', 'extract key concepts', or any text-based educational content wanting a structured breakdown. Produces, for a syllabus, a student-facing knowledge map and a readable knowledge-point deep-dive (both with matching .docx) plus a machine-readable knowledge base; for lecture content, a concept-and-example study outline. A second mode turns an existing knowledge-point deep-dive (03_...) into a class lesson plan (教案): the teacher selects the knowledge points for a session and gets a time-allocated 教案 (.md + .docx) — triggers include '教案', 'lesson plan', '备课', '这次课/本学时', '选中知识点生成教案'. Preserves source language unless translation is requested. Not for one-line document questions or quick answers."
+acceptance:
+  - id: deliverables_exist
+    describe: "The expected deliverables exist in the workspace and are non-empty: a knowledge map (.md + matching .docx), a machine-readable knowledge base (.md), and a knowledge-point deep-dive (.md + matching .docx)."
+    check_mode: mechanical
+  - id: knowledge_base_populated
+    describe: "The knowledge base lists real extracted knowledge points (IDs, names, domains, ratings), not a template or empty scaffold."
+    check_mode: mechanical
+  - id: faithful_to_source
+    describe: "Knowledge points are faithful to the source material — no invented facts, no hallucinated concepts absent from the syllabus."
+    check_mode: judgment
+  - id: language_preserved
+    describe: "Outputs preserve the source language unless the user asked for translation."
+    check_mode: judgment
 ---
 # Course Knowledge Extraction
 
@@ -12,8 +25,18 @@ Turns raw, text-based course material (teaching syllabi, notes, transcripts, art
 
 - If the user referenced a file, read it with your filesystem/read tools; if a path is relative, it resolves against the session workspace (your cwd).
 - If the user pasted text directly, use that.
-- **Input scope:** this skill handles text-based/Markdown input. If the user provides a PDF or DOCX syllabus, first extract it to text with a shell tool available in the sandbox (e.g. `pdftotext file.pdf -` for PDF, or `pandoc file.docx -t markdown` / `python-docx` for DOCX), then apply this workflow — don't attempt to parse binary formats directly here.
-- If material is split across multiple files/sources, read all of them before extracting — don't summarize partial input.
+- **Input scope & DOCX intake:** the extraction workflow operates on **text/Markdown**. Everything downstream (type detection, section mining, knowledge-point extraction) reads Markdown, so any non-text source is converted to Markdown *first*, as an explicit step — then the rest of the workflow is identical regardless of the original format.
+  - **DOCX** (the common case for a 教学大纲): convert it with the bundled **`scripts/docx_to_md.py`** — **don't hand-roll docx parsing or eyeball the binary**:
+    ```bash
+    # Produces a faithful, structure-preserving Markdown transcription.
+    # Pass --title with the course name so a Word Title-styled heading isn't lost.
+    python <skill_dir>/scripts/docx_to_md.py 大纲.docx 00_[课程名]_源大纲.md --title "[课程名]"
+    ```
+
+    Engine is `auto`: it uses **pandoc** if present (clean GFM, tables → pipe tables, CJK-safe) and falls back to **python-docx** (`uv add python-docx`) otherwise — force either with `--engine pandoc|python-docx`. At least one must be installed.
+  - **PDF:** `pdftotext file.pdf -` (or the `pdf`/`pdf-reading` skill) to get text, then proceed.
+- **What the converted Markdown should contain (the intermediate contract).** `docx_to_md.py` is a *transcriber, not an extractor* — it must preserve, not summarize. A good `00_..._源大纲.md` keeps: the **course title** (H1); **every section** of the syllabus (基本信息 / 课程目标 / 教学内容·学时分配 / 考核方式 / 教学方法 / 参考材料); and — most importantly — the syllabus's **tables as pipe tables**, since the 教学内容 table (chapters × 学时 × 重点·难点) and the 课程目标 table are the primary things the extraction step mines. Do a quick read of this file before extracting: if a critical table came through garbled (e.g. heavy merged cells flattened badly), fix that cell in the `.md` by hand rather than extracting from broken structure. Treat this file as an intermediate working artifact — deliver it too if useful, but its job is to feed step 2.
+- If material is split across multiple files/sources, convert/read all of them before extracting — don't summarize partial input.
 
 ### 2. Identify the material type, then extract accordingly
 
@@ -53,6 +76,7 @@ Mine sections in this priority order, each feeding a different aspect of the kno
 | -------- |
 | 概念     |
 | 理论     |
+| 原理     |
 | 原则     |
 | 制度     |
 | 法律文件 |
@@ -302,6 +326,7 @@ relative to the session workspace, but prefer the absolute repo path if you know
 
 - Write `01_[课程名]_知识地图.md`, `02_[课程名]_知识库.md`, and `03_[课程名]_知识点详解.md` into the workspace as described above.
 - Convert the two human-facing docs — the knowledge map **and** the deep-dive — to `.docx` with a bundled script — **don't write custom docx-generation code from scratch each time**. **Prefer the Python script** (`python-docx` is the reliable runtime here; the Node script needs the `docx` npm package, which is often not installed):
+
   ```bash
   # Python (preferred) — requires `python-docx` (uv add python-docx, or pip install if outside uv)
   # --pdf also emits a .pdf; --preview N renders the first N pages to PNG for a visual spot-check.
@@ -315,6 +340,7 @@ relative to the session workspace, but prefer the absolute repo path if you know
   Both take the same input/output arguments and flags. The Python version uses a **dual-font setup** by default — `Calibri` for Latin characters/numbers, `Microsoft YaHei` for CJK characters (override with `--latin-font` / `--cjk-font`) — and automatically compacts wide tables (6+ columns, e.g. the knowledge-point overview table) with a smaller font, tighter row spacing, and content-aware column widths (fixed table layout, CJK-aware) so they don't sprawl across many pages. The Node version uses a single font for everything by default (`--font` to override) and mirrors the Python heading hierarchy. Both handle headings, pipe tables, bullet lists, the fenced-code-block tree diagram, and `**bold**` spans — the deep-dive stays within this same subset (headings, bold labels, bullets, paragraphs). The knowledge base file (`02_...`) is the one exception: it stays markdown-only, since it's for machine consumption and doesn't need a Word version.
 - **PDF is an optional deliverable.** `--pdf` renders the `.docx` to `.pdf` via LibreOffice (`soffice`) — a good default to include, since a PDF renders identically everywhere regardless of the reader's Word version or installed fonts. Deliver PDFs for the same two human-facing docs (`01_...`, `03_...`); the knowledge base (`02_...`) stays markdown-only. If `soffice` isn't on PATH the script prints a note and still leaves the `.docx` — no failure.
 - **Verify the result** with the `--preview N` flag, which renders the first N pages of the PDF to `NAME_preview-*.png` (needs `pdftoppm`; present in the default environment) — read those PNGs to confirm layout. Worth it especially for very long tables or deeply nested tree diagrams the scripts weren't tuned for. `--preview` implies `--pdf`. If the tools aren't present the script degrades gracefully; fall back to sanity-checking the `.md`. The preview PNGs are throwaway — delete them once you've checked, they aren't deliverables.
+
   - If the markdown has content beyond what the scripts handle (e.g. nested sub-bullets, block quotes), either extend the relevant script or fall back to writing custom docx code for that document — don't silently drop content.
 
 **For Type B (lecture content):**
@@ -335,9 +361,168 @@ Before presenting, confirm the output is:
 - **Not verbatim** — core content is summarized/paraphrased, not copied from the syllabus
 - **Not invented** (map & base) — the knowledge map and knowledge base add nothing not implied by the source; the deep-dive (`03_...`) may elaborate with accurate general domain knowledge, but still fabricates no *course-specific* specifics and flags uncertainty (see its sourcing caveat)
 
+## Mode 2 — Lesson-plan generation (教案)
+
+The workflow above (Mode 1) turns a syllabus into knowledge artifacts. **Mode 2 turns
+those artifacts back into a teachable class plan.** A course is taught over many sessions
+(e.g. 32 学时 at 2 学时/次 ≈ 16 次课); for a given session the teacher **selects the
+knowledge points to cover** and wants a 教案 for exactly those points. The selection is the
+only thing that changes the shape: 3 points × 2 学时 → a deep new-teaching plan; every point
+× 2 学时 → a review/synthesis plan for the final session. Same engine, different `--select`.
+
+**Input is the deep-dive (`03_...`), which is the sole source of truth.** The teacher edits
+and corrects `03_..._知识点详解.docx`; the machine-readable knowledge base (`02_...`) is often
+absent or stale, so Mode 2 reads **only Output 3**. Because the corrected content lives in
+`.docx`, the first step is always to re-ingest it to Markdown.
+
+### Pipeline
+
+```
+① 回灌   03_*.docx → docx_to_md.py → 03.md            (authoritative content is in .docx)
+② 解析   parse_knowledge.py 03.docx → JSON            (points + course context)
+③ 选点   --select K001,K008,...                        (the teacher's chosen points)
+④ 教学设计  order by prerequisites; allocate time by importance/difficulty & plan_mode
+⑤ 渲染   author 04_[课程名]_[课时名]_教案.md
+⑥ 转换   md_to_docx.py --pdf --preview 2 → 04_..._教案.docx
+```
+
+**`scripts/parse_knowledge.py`** parses a deep-dive (`.docx` — converted internally — or a
+pre-converted `.md`) into structured JSON: `course` (title, 概况, 总学时, 课程目标) plus one
+object per point (`id`, `knowledge_domain`, `point_type`, `importance`/`difficulty` as 1–5,
+`supports_objectives`, `definition`, `learning_significance`, `detailed_explanation`,
+`examples`, `key_points_and_difficulties`, `prerequisites`/`successors`/`related`).
+
+```bash
+# 0) LINT FIRST — surface teacher-editing slips (dup IDs, bad/compound 知识域, wrong 类型,
+#    missing 定义, dangling relations) before building a 教案 on inconsistent data.
+python <skill_dir>/scripts/parse_knowledge.py --lint 03_[课程名]_知识点详解.docx
+# fix any ERROR in the source .docx first (a compound 知识域, a 类型 slot holding a 知识域, etc.)
+
+# 1) parse only the selected points to JSON
+python <skill_dir>/scripts/parse_knowledge.py 03_[课程名]_知识点详解.docx \
+    --select K001,K008,K014 --pretty -o points.json
+```
+
+`learning_outcomes` is **not** in the JSON (it lived in the absent knowledge base) — synthesise
+the 能力目标 from each point's `definition` + `learning_significance` + `detailed_explanation`.
+
+### Ask the teacher for the session parameters
+
+Selection alone doesn't fix the plan's shape — also get (or infer, then confirm):
+
+- **学时数 & 每学时分钟** (e.g. 2 学时 × 45 min = 90 min) — drives time allocation.
+- **课时名/课题** — goes in the title and filename.
+- **plan_mode** — `新授` (deep, per-point teaching), `复习综合` (many points, survey + 重难点
+  only), or `单元总结` (a 知识域's points, emphasise connections). If points-per-minute is high,
+  it's implicitly a 复习综合 plan — don't try to deep-teach 20 points in 90 minutes.
+- **授课对象** — defaults to the 03 课程概况 table's 授课对象 if the teacher doesn't specify.
+
+### The 教案 template (Output 4)
+
+```
+# [课程名] 教案 · [课时名]
+
+## 基本信息
+| 项目 | 内容 |
+| ---- | ---- |
+| 课程名称 | ... |
+| 授课课题 | [课时名] |
+| 学时 | N 学时（约 M 分钟） |
+| 授课对象 | ... |
+| 涉及知识点 | K001 名称、K008 名称 … |
+
+## 教学目标
+- **知识目标**：学生能够…（源自选中点的 定义 / 核心内容）
+- **能力目标**：学生能够…（行为动词，源自 学习意义 + 详细讲解，合成 learning_outcomes）
+- **素养目标**：…（源自 中国实践 / 思政点 / 该点支撑的 课程目标）
+
+## 教学重点与难点
+- **重点**：K0xx 名称 — …（importance ★★★★★ 的点 + 重点难点提示）
+- **难点**：K0xx 名称 — …（difficulty ★★★★★ 的点 + 重点难点提示）
+
+## 教学方法
+讲授法 / 案例讨论 / 小组研讨 …（依知识点类型选：概念→讲授，案例→讨论，方法→演示练习）
+
+## 教学过程（共 M 分钟）
+
+### 导入（约 X 分钟）
+情境/问题导入，衔接前置知识点。
+
+### 新课讲授
+#### 环节一 · K001 [名称]（约 X 分钟）
+- **讲授内容**：…（提炼自 详细讲解 的要点，非照抄）
+- **师生活动**：…（提问 / 讨论 / 举例，用该点的 示例/案例）
+- **设计意图**：…（为什么这样教，呼应重点难点）
+
+#### 环节二 · K008 [名称]（约 X 分钟）
+…（每个选中知识点一个环节，按前置关系排序）
+
+### 课堂小结（约 X 分钟）
+串联本节知识点，回扣教学目标。
+
+### 作业 / 思考题
+…（依重难点设计）
+
+## 板书设计
+选中知识点的结构与关联（可用 knowledge relations 画简图）。
+
+## 教学反思
+（课后填写，留空）
+```
+
+### Field mapping (教案栏目 ← 03 字段)
+
+| 教案栏目              | 来源                                                                   |
+| --------------------- | ---------------------------------------------------------------------- |
+| 基本信息 / 涉及知识点 | Request 参数 + 选中点的`id`·`name`                                |
+| 知识目标              | 选中点的`definition`                                                 |
+| 能力目标              | 合成自`learning_significance` + `detailed_explanation`（行为动词） |
+| 素养目标              | 中国实践/思政点 +`supports_objectives` → 课程目标文本               |
+| 教学重点              | `importance` 高的点 + `key_points_and_difficulties`                |
+| 教学难点              | `difficulty` 高的点 + `key_points_and_difficulties`                |
+| 教学方法              | 依`point_type` 推荐                                                  |
+| 教学过程各环节        | `detailed_explanation` + `examples`，按 `prerequisites` 排序     |
+| 板书设计              | 选中点名称 +`prerequisites`/`successors`/`related` 关系          |
+
+### Time-allocation heuristics (the core of a good 教案)
+
+The hard part is fitting the selected points into the available minutes:
+
+- Reserve ~10–15% for **导入** and ~10% for **小结**; the rest is the 讲授 budget.
+- Split the 讲授 budget across selected points **weighted by `importance + difficulty`** — a
+  ★★★★★/★★★★★ point earns more minutes than a ★★★☆☆/★★★☆☆ one.
+- **Sanity-check density.** If the 讲授 budget ÷ point-count leaves only a couple of minutes
+  each, it's a `复习综合` plan: group points by 知识域, cover only 重点/难点 and connections,
+  don't author a full 环节 per point.
+- **Order by dependency**, not ID: use `prerequisites`/`successors` to sequence 环节 so a point
+  is taught after the points it builds on.
+- Every 环节's minutes must sum (with 导入 + 小结) to the total M minutes — state each 环节's
+  minutes and make the arithmetic add up.
+
+### Naming & conversion
+
+`04_[课程名]_[课时名]_教案.md`, converted to `.docx` with the same output-side script as Mode 1:
+
+```bash
+python <skill_dir>/scripts/md_to_docx.py 04_[课程名]_[课时名]_教案.md 04_[课程名]_[课时名]_教案.docx --pdf --preview 2
+```
+
+### Quality checklist (Mode 2)
+
+- **Complete** — `04_..._教案.md` + `.docx` exist and are non-empty.
+- **Covers the selection** — every selected knowledge point appears in 教学过程 (a 环节, or a
+  named item in the 复习综合 grouping) and is reflected in at least one 教学目标.
+- **Time adds up** — the per-环节 minutes plus 导入/小结 equal the stated total M minutes.
+- **Faithful to `03_...`** — teaching content is drawn from the selected points' 详细讲解/示例;
+  it may elaborate with accurate general domain knowledge but invents no course-specific
+  specifics the deep-dive doesn't state.
+- **Objectives traceable** — 素养目标 map back to the course objectives the points support.
+
 ## Notes
 
-- **Bundled scripts:** `scripts/md_to_docx.py` (preferred) and `scripts/md_to_docx.js` (relative to this skill's directory) both convert this skill's markdown output into `.docx`, and — with `--pdf` / `--preview N` — optionally into a `.pdf` (via LibreOffice/`soffice`) plus PNG page previews (via `pdftoppm`) in the same call. The Python version requires `python-docx` (present in this environment); the Node version requires the `docx` npm package (often not installed) — prefer Python unless you've confirmed the npm package is available. Both are intentionally narrow converters tuned to this skill's own markdown shape (headings, pipe tables, bullets, one fenced code block for the tree diagram, `**bold**`) — not general Markdown-to-Word tools, and they emit the same heading hierarchy and share the same CLI flags. The PDF/preview steps shell out to the system `soffice`/`pdftoppm` (each PDF conversion uses an isolated LibreOffice profile so parallel subagents don't collide) and no-op with a printed note if those tools are absent.
+- **Bundled scripts — input side:** `scripts/docx_to_md.py` converts a source `.docx` (a 教学大纲) *into* Markdown at the start of the workflow — the input-side companion to the output-side `md_to_docx` scripts. It's a faithful transcriber (preserves sections and tables; does **not** extract), using pandoc when available and falling back to `python-docx`. It's the one bundled script that is a *reasonably general* docx→md converter rather than being tuned to this skill's own markdown shape.
+- **Bundled scripts — output side:** `scripts/md_to_docx.py` (preferred) and `scripts/md_to_docx.js` (relative to this skill's directory) both convert this skill's markdown output into `.docx`, and — with `--pdf` / `--preview N` — optionally into a `.pdf` (via LibreOffice/`soffice`) plus PNG page previews (via `pdftoppm`) in the same call. The Python version requires `python-docx` (present in this environment); the Node version requires the `docx` npm package (often not installed) — prefer Python unless you've confirmed the npm package is available. Both are intentionally narrow converters tuned to this skill's own markdown shape (headings, pipe tables, bullets, one fenced code block for the tree diagram, `**bold**`) — not general Markdown-to-Word tools, and they emit the same heading hierarchy and share the same CLI flags. The PDF/preview steps shell out to the system `soffice`/`pdftoppm` (each PDF conversion uses an isolated LibreOffice profile so parallel subagents don't collide) and no-op with a printed note if those tools are absent.
+- **Bundled scripts — knowledge re-ingestion (Mode 2):** `scripts/parse_knowledge.py` parses a `03_..._知识点详解` (`.docx`, converted internally via `docx_to_md`, or a pre-converted `.md`) back into structured JSON (course context + one object per knowledge point), the input engine for lesson-plan generation. `--select K001,K008` keeps only chosen points; `--lint` (accepts a file **or a directory** of courses) reports source-data inconsistencies — duplicate IDs, non-vocab/compound 知识域, a 类型 slot mistakenly holding a 知识域, missing 定义, dangling relation references — and exits non-zero on any ERROR, so it doubles as a pre-flight check on teacher-corrected deep-dives. `--batch <dir>` exports one `<课程名>_knowledge.json` per course (beside each `03_...` docx, or under `--out-dir`), lint-gated so a course with ERRORs is skipped rather than exported dirty — the way to persist a whole course library to JSON and re-run whenever a deep-dive is corrected. Unlike the `02_...` knowledge base it does not emit `learning_outcomes` (synthesise those downstream).
 - This skill is for **text-based** material (notes, transcripts already in text form, articles, syllabi). If the user has raw video/audio or slide decks, first get the content into text, then apply this workflow.
 - If the material is very long (e.g. a syllabus with 15+ chapters), consider whether to split the knowledge base file by module — check with the user if unsure.
 - The 知识域/知识点类型 taxonomies are the current default classification scheme (well-suited to law/governance/social-science courses). If a course's subject matter doesn't fit well, ask whether to adapt before proceeding rather than force-fitting content into a poor category.
