@@ -128,14 +128,22 @@ class LiveDisplay:
         }
         for agent in entries:
             style, icon = state_styles.get(agent.state, ("", "?"))
-            display_status = agent.status or agent.last_command or ""
+            # A streaming subagent's live token tail takes over the status cell until the
+            # turn settles; otherwise show its status or last command.
+            if agent.output_tail:
+                status_cell = Text(agent.output_tail.replace("\n", " "), style="dim")
+            else:
+                status_cell = Text(
+                    agent.status or agent.last_command or "",
+                    style="italic" if agent.status else "dim italic",
+                )
             table.add_row(
                 Text(icon, style=style),
                 Text(agent.name),
                 Text(f"[{agent.state}]", style=style),
                 Text(agent.gpu or "", style="dim") if agent.gpu else Text(""),
                 Text(str(agent.turns), style="dim") if agent.turns else Text(""),
-                Text(display_status, style="italic" if agent.status else "dim italic"),
+                status_cell,
             )
 
         count = len(entries)

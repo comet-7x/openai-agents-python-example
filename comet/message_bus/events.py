@@ -95,6 +95,18 @@ class SubagentCommand(Event):
 
 
 @dataclass(frozen=True)
+class SubagentOutput(Event):
+    """A token-level delta from a subagent's *own* LLM stream, published only when
+    subagent streaming is enabled (`--stream-subagents`). `channel` separates
+    reasoning from the visible answer. This is a display/observability signal — the
+    parent's consumption is unchanged: it still uses the subagent's final result."""
+
+    id: str = ""
+    delta: str = ""
+    channel: Literal["thinking", "text"] = "text"
+
+
+@dataclass(frozen=True)
 class SubagentDeleted(Event):
     id: str = ""
 

@@ -39,7 +39,11 @@ _client = AsyncOpenAI(
     max_retries=1,
 )
 
-_model = ConcurrencyLimitedModel(model=config.LLM_MODEL, openai_client=_client)
+_model = ConcurrencyLimitedModel(
+    max_concurrency=config.LLM_MAX_CONCURRENCY,
+    model=config.LLM_MODEL,
+    openai_client=_client,
+)
 
 _SPINNER_FRAMES = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]
 
@@ -256,9 +260,11 @@ class StreamUI:
         self._last_char = "\n"
 
         if tool == "finish":
-            # finish() ends the run via StopAtTools — the model never gets a
-            # follow-up turn to emit real "text", so its summary IS the final
-            # answer. Show it in full, not truncated like a regular tool arg.
+            # finish() ends the run via the orchestrator's finish-gate (once a clean
+            # verify() has passed); on that terminal call the model emits no further
+            # "text", so its summary IS the final answer. Show it in full, not
+            # truncated like a regular tool arg. (A rare gate-refused finish — called
+            # before verifying — renders here too, then the run continues.)
             self._live.console.print(Text("Answer", style="bold green"))
             summary = args.get("summary")
             if isinstance(summary, str) and summary.strip():
@@ -289,7 +295,7 @@ class StreamUI:
         tool_name = self._pending.pop(call_id, None) if call_id else None
 
         if tool_name == "finish":
-            # finish() ends the run (StopAtTools) — this is the turn's completion.
+            # finish() ends the run via the finish-gate — this is the turn's completion.
             self._set_message_done()
             return
         if tool_name == "set_status":
@@ -481,23 +487,26 @@ class StreamDisplay(RobustStreamUI):
 
         for e in entries:
             style, icon = _STATE_STYLES.get(e.state, ("", "?"))
+            # While streaming, the live token tail takes over the status cell; once the
+            # turn settles the tail clears and status/command shows again.
+            if e.output_tail:
+                status_cell = Text(e.output_tail.replace("\n", " "), style="dim")
+            else:
+                status_cell = Text(
+                    "  ".join(
+                        filter(
+                            None,
+                            [e.status, f"$ {e.last_command}" if e.last_command else None],
+                        )
+                    ),
+                    style="italic dim",
+                )
             table.add_row(
                 Text(icon, style=style),
                 Text(e.name),
                 Text(f"[{e.state}]", style=style),
                 Text(str(e.turns), style="dim"),
-                Text(
-                    "  ".join(
-                        filter(
-                            None,
-                            [
-                                e.status,
-                                f"$ {e.last_command}" if e.last_command else None,
-                            ],
-                        )
-                    ),
-                    style="italic dim",
-                ),
+                status_cell,
             )
 
         count = len(entries)
@@ -729,7 +738,9 @@ def _print_usage_summary(
     )
 
 
-def _new_session(session_name: str | None = None) -> tuple[OrchestratorAgent, SystemView]:
+def _new_session(
+    session_name: str | None = None, stream_subagents: bool = False
+) -> tuple[OrchestratorAgent, SystemView]:
     """Compose one session: a bus, a SystemView fed by it, and an orchestrator
     that publishes to it. Displays render the view; nobody polls the agents.
 
@@ -743,7 +754,9 @@ def _new_session(session_name: str | None = None) -> tuple[OrchestratorAgent, Sy
         logger = JsonlLogger.for_run(config.TRACES_DIR)
         bus.subscribe(logger.handle)
         print(f"trace → {logger.path}", file=sys.stderr)
-    orchestrator = OrchestratorAgent(model=_model, bus=bus, session_id=session_name)
+    orchestrator = OrchestratorAgent(
+        model=_model, bus=bus, session_id=session_name, stream_subagents=stream_subagents
+    )
     if orchestrator.persistent:
         verb = "resuming" if orchestrator.resuming else "new"
         print(
@@ -754,10 +767,14 @@ def _new_session(session_name: str | None = None) -> tuple[OrchestratorAgent, Sy
 
 
 async def main(
-    prompt: str | None, interactive: bool, stream: bool, session: str | None = None
+    prompt: str | None,
+    interactive: bool,
+    stream: bool,
+    session: str | None = None,
+    stream_subagents: bool = False,
 ) -> None:
     if prompt is not None:
-        orchestrator, view = _new_session(session)
+        orchestrator, view = _new_session(session, stream_subagents)
         try:
             if stream:
                 await _run_stream(orchestrator, prompt, view)
@@ -776,7 +793,7 @@ async def main(
         return
 
     if interactive:
-        orchestrator, view = _new_session(session)
+        orchestrator, view = _new_session(session, stream_subagents)
         try:
             if stream:
                 await _interactive_queue_stream(orchestrator, view)
@@ -807,8 +824,7 @@ async def main(
     print('No prompt provided. Use --prompt "<prompt>" or --interactive to run.')
 
 
-def run() -> None:
-    """Console-script entry point (`comet`). Also invoked by ``python -m comet.cli``."""
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--prompt",
@@ -829,15 +845,36 @@ def run() -> None:
         help="Stream output with live tool-call display.",
     )
     parser.add_argument(
+        "--stream-subagents",
+        action="store_true",
+        default=config.STREAM_SUBAGENTS,
+        help="Also surface each subagent's own token stream (reasoning + answer) live "
+        "in its row. Display-only; the orchestrator still consumes final results. "
+        "Defaults to COMET_STREAM_SUBAGENTS.",
+    )
+    # nargs="?" makes the value optional: bare `--session` falls back to `const`
+    # (the conventional name "default"); `--session NAME` uses NAME; omitting the
+    # flag leaves it None (anonymous, in-memory).
+    parser.add_argument(
         "--session",
         type=str,
+        nargs="?",
+        const="default",
         default=None,
         metavar="NAME",
         help="Named, resumable session: file-backs the conversation under "
-        "workspaces/NAME/ so it survives a restart. Omit for a throwaway in-memory session.",
+        "workspaces/NAME/ so it survives a restart. Bare --session uses the name "
+        "'default'. Omit the flag entirely for a throwaway in-memory session.",
     )
-    args = parser.parse_args()
-    asyncio.run(main(args.prompt, args.interactive, args.stream, args.session))
+    return parser
+
+
+def run() -> None:
+    """Console-script entry point (`comet`). Also invoked by ``python -m comet.cli``."""
+    args = _build_parser().parse_args()
+    asyncio.run(
+        main(args.prompt, args.interactive, args.stream, args.session, args.stream_subagents)
+    )
 
 
 if __name__ == "__main__":

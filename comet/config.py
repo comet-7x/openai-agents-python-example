@@ -61,3 +61,9 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "")
 # (indistinguishable from a hang). Tune per backend.
 LLM_MAX_CONCURRENCY = int(os.environ.get("LLM_MAX_CONCURRENCY", "4"))
 LLM_REQUEST_TIMEOUT = float(os.environ.get("LLM_REQUEST_TIMEOUT", "120"))
+
+# Surface subagents' own token stream (reasoning + answer) as SubagentOutput events
+# for the live display. Off by default (subagents run non-streamed); the `--stream-subagents`
+# CLI flag or COMET_STREAM_SUBAGENTS=1 turns it on. Display-only — it never changes what
+# the orchestrator consumes from a subagent (always the final result).
+STREAM_SUBAGENTS = os.environ.get("COMET_STREAM_SUBAGENTS", "0") != "0"

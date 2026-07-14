@@ -17,7 +17,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
 
-from comet.message_bus.events import Event
+from comet.message_bus.events import Event, SubagentOutput
 
 
 class JsonlLogger:
@@ -32,6 +32,10 @@ class JsonlLogger:
         return cls(traces_dir / f"run_{run_id}.jsonl")
 
     def handle(self, event: Event) -> None:
+        # Skip token-level SubagentOutput: it's a high-volume display-only signal
+        # (one event per token, flushed each time) that would bloat the audit trace.
+        if isinstance(event, SubagentOutput):
+            return
         record: dict[str, object] = {"event": type(event).__name__}
         if is_dataclass(event) and not isinstance(event, type):
             record.update(asdict(event))

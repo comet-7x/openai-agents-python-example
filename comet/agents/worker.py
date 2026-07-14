@@ -8,11 +8,17 @@ from agents import (
     AgentHooks,
     ModelSettings,
     OpenAIChatCompletionsModel,
+    RawResponsesStreamEvent,
     Tool,
     function_tool,
 )
 from agents.memory import SQLiteSession
 from agents.run import Runner
+from openai.types.responses import (
+    ResponseReasoningSummaryTextDeltaEvent,
+    ResponseReasoningTextDeltaEvent,
+    ResponseTextDeltaEvent,
+)
 
 from comet import config
 from comet.message_bus import events as ev
@@ -50,10 +56,21 @@ pitfalls. Keep using the shell for running code, installs, and pipelines.
 - If the same error recurs three times with no variation in approach, stop and report - don't loop blindly.
 
 ## Reporting
-Your output goes directly into the orchestrator's context. Keep it tight:
-- Report results only: file paths, metrics, outputs, errors.
-- No process narration, no "I started by...".
-- If genuinely blocked after exhausting options, state the blocker in one sentence.\
+Your final message goes straight into the orchestrator's context and is parsed for a
+structured report. Keep prose minimal (results only, no "I started by..."), then END
+your final message with a fenced json block in exactly this shape:
+
+```json
+{"status": "done",
+ "manifest": [{"path": "report.md", "kind": "file", "detail": "13KB, 8 sections"}],
+ "summary": "one or two sentences of concrete results",
+ "blockers": ""}
+```
+
+- status: "done" | "blocked" | "partial".
+- manifest: every deliverable you produced, each with a concrete `detail` (size / row
+  count / key fields) so the orchestrator can verify it. kind is "file" | "metric" | "answer".
+- blockers: one sentence if you are blocked after exhausting options, else "".\
 """
 
 
@@ -82,10 +99,19 @@ class WorkerAgent:
         workspace_dir: Path | None = None,
         extra_tools: list[Tool] | None = None,
         bus: MessageBus | None = None,
+        skills: tuple[str, ...] = (),
+        stream_output: bool = False,
     ) -> None:
         self.id = id
         self.name = name
         self.gpu: str | None = None  # always None; kept for display compatibility
+        # When True, run via Runner.run_streamed and publish token-level
+        # SubagentOutput events for the live display (see _execute).
+        self.stream_output = stream_output
+        # The skills this worker was spawned with — the orchestrator reads these at
+        # invoke time to fold each skill's declared acceptance criteria into the
+        # delegation (see orchestrator.invoke_subagent).
+        self.skills = skills
         self._bus = bus or MessageBus()
 
         # Shared per-session workspace: all subagents in a session use the same
@@ -150,7 +176,7 @@ class WorkerAgent:
             ],
             # include_usage=True so token counts arrive even with a custom
             # LLM_BASE_URL (see the note in orchestrator.py).
-            model_settings=ModelSettings(tool_choice="required", include_usage=True),
+            model_settings=ModelSettings(tool_choice="auto", include_usage=True),
             hooks=hooks,
         )
 
@@ -177,17 +203,44 @@ class WorkerAgent:
             lines.append(f"Last command: {self.last_command}")
         return "  ".join(lines)
 
+    async def _execute(self, prompt: str) -> Any:
+        """Run the agent to completion and return its RunResult.
+
+        With `stream_output` set, drive `Runner.run_streamed` and publish each
+        reasoning/visible delta as a `SubagentOutput` event — token-level surfacing
+        for the live display. This does NOT change what the parent consumes: the
+        orchestrator still awaits `run_task` and reads the *final* result. Streaming
+        is safe here because the run is a background task on the shared event loop and
+        every step is non-blocking (async model, asyncio subprocess), so publishing
+        deltas never stalls the orchestrator's own stream. Without the flag, the
+        cheaper non-streamed `Runner.run` is used."""
+        if not self.stream_output:
+            return await Runner.run(
+                self.agent, prompt, max_turns=200, session=self.conv_session
+            )
+        streaming = Runner.run_streamed(
+            self.agent, prompt, max_turns=200, session=self.conv_session
+        )
+        async for event in streaming.stream_events():
+            if isinstance(event, RawResponsesStreamEvent):
+                data = event.data
+                if isinstance(data, ResponseTextDeltaEvent):
+                    self._bus.publish(
+                        ev.SubagentOutput(id=self.id, delta=data.delta, channel="text")
+                    )
+                elif isinstance(
+                    data,
+                    (ResponseReasoningTextDeltaEvent, ResponseReasoningSummaryTextDeltaEvent),
+                ):
+                    self._bus.publish(
+                        ev.SubagentOutput(id=self.id, delta=data.delta, channel="thinking")
+                    )
+        return streaming
+
     async def run(self, prompt: str) -> None:
         """Start a background task to run the worker agent (non-blocking)."""
         start = time.perf_counter()
-        self.run_task = asyncio.create_task(
-            Runner.run(
-                self.agent,
-                prompt,
-                max_turns=200,
-                session=self.conv_session,
-            )
-        )
+        self.run_task = asyncio.create_task(self._execute(prompt))
         self._bus.publish(ev.SubagentState(id=self.id, state="running"))
 
         def _on_done(task: asyncio.Task[Any]) -> None:

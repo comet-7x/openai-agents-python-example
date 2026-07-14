@@ -42,6 +42,11 @@ class SkillFrontmatter:
     description: str
     metadata: dict[str, str] = field(default_factory=dict)
     allowed_tools: list[str] | None = None
+    # Baseline acceptance criteria the skill declares as its definition-of-done —
+    # raw dicts (id/describe/check_mode), kept vocabulary-free here so this leaf
+    # never imports the agents-layer Criterion type. The orchestrator merges these
+    # with its own task-specific criteria when it delegates (see agents/protocol.py).
+    acceptance: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -89,11 +94,17 @@ def _parse_frontmatter(raw_yaml: str, source: Path) -> SkillFrontmatter:
         description = data["description"]
     except KeyError as e:
         raise SkillError(f"{source}: frontmatter missing required key {e}") from e
+    acceptance = data.get("acceptance") or []
+    if not isinstance(acceptance, list) or not all(
+        isinstance(c, dict) and c.get("id") and c.get("describe") for c in acceptance
+    ):
+        raise SkillError(f"{source}: 'acceptance' must be a list of {{id, describe}} entries")
     return SkillFrontmatter(
         name=name,
         description=description,
         metadata=data.get("metadata") or {},
         allowed_tools=data.get("allowed-tools"),
+        acceptance=acceptance,
     )
 
 
@@ -162,6 +173,16 @@ class SkillsRegistry:
         if not target.is_file():
             raise SkillError(f"reference '{rel_path}' not found in skill '{name}'")
         return target.read_text()
+
+    def load_acceptance(self, name: str) -> list[dict]:
+        """A skill's declared baseline acceptance criteria (raw {id, describe,
+        check_mode} dicts), or [] if it declares none. The orchestrator converts
+        these to Criterion objects and merges them into every delegation that
+        equips this skill."""
+        skill = self._skills.get(name)
+        if skill is None:
+            raise SkillError(f"skill '{name}' not found")
+        return list(skill.frontmatter.acceptance)
 
     def load_tools(self, name: str) -> list[Tool]:
         """Tools a skill grants to a worker spawned with it. No skill defines

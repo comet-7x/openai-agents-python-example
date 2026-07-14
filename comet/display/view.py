@@ -12,6 +12,10 @@ from dataclasses import dataclass, field
 
 from comet.message_bus import events as ev
 
+# How many trailing chars of a streaming subagent's output to keep for the live
+# row (the table cell is single-line/ellipsised, so this is just a rolling tail).
+_OUTPUT_TAIL = 200
+
 
 @dataclass
 class OrchestratorView:
@@ -31,6 +35,7 @@ class SubagentView:
     turns: int = 0
     status: str | None = None
     last_command: str | None = None
+    output_tail: str = ""  # rolling tail of the current turn's streamed tokens
     gpu: str | None = None  # reserved; kept for panel parity
 
 
@@ -76,9 +81,15 @@ class SystemView:
             case ev.SubagentState(id=sid, state=state):
                 if (sub := self.subagents.get(sid)) is not None:
                     sub.state = state
+                    if state != "running":
+                        sub.output_tail = ""  # settle the row once the run ends
             case ev.SubagentTurn(id=sid):
                 if (sub := self.subagents.get(sid)) is not None:
                     sub.turns += 1
+                    sub.output_tail = ""  # fresh tail per turn — show current activity
+            case ev.SubagentOutput(id=sid, delta=delta):
+                if (sub := self.subagents.get(sid)) is not None:
+                    sub.output_tail = (sub.output_tail + delta)[-_OUTPUT_TAIL:]
             case ev.SubagentStatus(id=sid, status=s):
                 if (sub := self.subagents.get(sid)) is not None:
                     sub.status = s

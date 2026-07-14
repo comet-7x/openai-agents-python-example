@@ -50,6 +50,37 @@ def make_read_tool(ctx: ToolContext):
     return read_file
 
 
+def make_list_tool(ctx: ToolContext):
+    async def list_dir(path: str = ".") -> str:
+        """List a workspace directory's entries with type and byte size (use '.' for
+        the workspace root). Read-only; the path is confined to the workspace. Use
+        this to check what a subagent actually produced before trusting its report."""
+        try:
+            target = _resolve(ctx, path)
+        except ValueError as e:
+            return f"Error: {e}"
+        if not target.exists():
+            return f"Error: not found: {path}"
+        if target.is_file():
+            return f"{path}\t{target.stat().st_size} bytes (file)"
+
+        def _listing() -> str:
+            rows = []
+            for p in sorted(target.iterdir()):
+                try:
+                    if p.is_dir():
+                        rows.append(f"{p.name}/\t(dir)")
+                    else:
+                        rows.append(f"{p.name}\t{p.stat().st_size} bytes")
+                except OSError:
+                    rows.append(f"{p.name}\t(unreadable)")
+            return "\n".join(rows) if rows else "(empty)"
+
+        return await asyncio.to_thread(_listing)
+
+    return list_dir
+
+
 def make_write_tool(ctx: ToolContext):
     async def write_file(path: str, content: str) -> str:
         """Write `content` to a file in the workspace, creating parent dirs.

@@ -13,7 +13,7 @@ from agents import (
     OpenAIChatCompletionsModel,
     RawResponsesStreamEvent,
     RunItemStreamEvent,
-    StopAtTools,
+    ToolsToFinalOutputResult,
     function_tool,
 )
 from agents.items import (
@@ -31,11 +31,20 @@ from openai.types.responses import (
 )
 
 from comet import config
+from comet.agents.protocol import (
+    Criterion,
+    CriterionVerdict,
+    SubagentRequest,
+    SubagentResponse,
+    merge_acceptance,
+)
 from comet.agents.stream import StreamChunk
 from comet.agents.worker_pool import WorkerAgentPool
 from comet.message_bus import events as ev
 from comet.message_bus.bus import MessageBus
 from comet.skills.registry import SkillError, SkillsRegistry
+from comet.tools.context import ToolContext
+from comet.tools.filesystem import make_list_tool, make_read_tool
 
 ORCHESTRATOR_INSTRUCTIONS = """
 You are a relentless execution agent. Your only job is to get the user's task fully done - not \
@@ -69,6 +78,30 @@ guidance, then follow it closely. (list_skills re-lists the same set at any time
 Some skills bundle reference docs or scripts - use list_skill_resources and
 read_skill_reference to pull those in only when you actually need them; hand
 script paths to a worker agent's shell tool to run them.
+
+## Delegating work
+When you invoke_subagent, give it acceptance criteria: concrete, checkable statements
+of what "done" requires. Tag each criterion's check_mode:
+- "mechanical" - verifiable by inspecting the workspace (a file exists / is non-empty /
+  parses / has the right shape). You will check these yourself.
+- "judgment" - requires reading and reasoning about content quality (faithfulness, no
+  hallucination, correct organization). These need an independent verifier.
+Criteria a skill declares are folded in automatically; add task-specific ones on top.
+
+## Verification loop (run before you finish - this is not optional)
+A subagent's report is a CLAIM, not proof. Your "done" must be justified by evidence
+YOU gathered, not by the worker's self-report. Before finishing:
+1. For each MECHANICAL criterion: check ground truth yourself with list_dir and
+   read_file (you can read the shared workspace directly). Confirm files exist, are
+   non-empty, and look right - don't trust the worker's manifest.
+2. For each JUDGMENT criterion: spawn a NEW, independent verifier subagent. Give it
+   only the acceptance criteria and the artifact paths - NOT the producer's summary or
+   reasoning (that would just anchor it). Have it judge the artifacts against the
+   criteria and report pass/fail with specific defects.
+3. Keep verification proportional: sample and spot-check, never redo the work.
+4. Call verify(...) with a verdict for every criterion. If any fails, fix it (re-delegate)
+   and re-verify - do not finish. Only once every criterion passes may you call finish;
+   finish is gated on a clean verify and will be refused otherwise.
 """
 
 
@@ -120,27 +153,46 @@ class OrchestratorAgent:
         model: OpenAIChatCompletionsModel,
         bus: MessageBus | None = None,
         session_id: str | None = None,
+        stream_subagents: bool = False,
     ) -> None:
         self._bus = bus or MessageBus()
 
         # One workspace per session, shared by all subagents so their files
         # (reports, data) are visible to each other and persist across turns.
-        self.session_id = session_id or datetime.now(config.TIMEZONE).strftime("sess_%Y%m%d_%H%M%S")
+        # Normalize the name once so persistence and workspace-naming key off the SAME
+        # predicate: an empty/whitespace `--session ""` is anonymous, not a "named"
+        # session pointing at a timestamped dir it could never resume.
+        name = (session_id or "").strip()
+        self.persistent = bool(name)
+        self.session_id = name or datetime.now(config.TIMEZONE).strftime("sess_%Y%m%d_%H%M%S")
         self.session_workspace = config.WORKSPACES_ROOT / self.session_id
         self.session_workspace.mkdir(parents=True, exist_ok=True)
 
-        # A *named* session (session_id given, i.e. `--session NAME`) persists its
-        # conversation to a SQLite file in the workspace, so `run()` resumes it after a
-        # restart; an anonymous (timestamped) session stays in-memory and is discarded
-        # on exit. `resuming` is true only when that file already exists from a prior run.
-        self.persistent = session_id is not None
+        # A *named* session (via `--session NAME`) persists its conversation to a SQLite
+        # file in the workspace, so `run()` resumes it after a restart; an anonymous
+        # (timestamped) session stays in-memory and is discarded on exit. `resuming` is
+        # true only when that file already exists from a prior run.
         _db_file = self.session_workspace / "session.db"
         self.resuming = self.persistent and _db_file.exists()
 
         self._pool = WorkerAgentPool(
-            model=model, bus=self._bus, session_workspace=self.session_workspace
+            model=model,
+            bus=self._bus,
+            session_workspace=self.session_workspace,
+            stream_subagents=stream_subagents,
         )
         self._skills = SkillsRegistry(config.SKILLS_DIR)
+
+        # Read-only view of the shared session workspace, so the orchestrator can
+        # verify mechanical acceptance criteria against ground truth itself (list_dir /
+        # read_file) instead of spawning a subagent just to `stat` a file. Confined to
+        # the workspace by filesystem._resolve, exactly like the worker file tools.
+        self._fs_ctx = ToolContext(workspace_dir=self.session_workspace)
+
+        # Finish gate: set True only by a clean verify() call, reset at the start of
+        # every run. The callable tool_use_behavior (_finish_gate) refuses to let
+        # finish() terminate the run unless this is True — a hard gate, not a prompt hope.
+        self._verified = False
 
         # Kept as None for display.py compatibility
         self._reasoning_effort: None = None
@@ -160,7 +212,10 @@ class OrchestratorAgent:
             # LLM_BASE_URL: the SDK only sets stream_options={"include_usage": True}
             # by default for the official OpenAI client, else streams zero usage.
             model_settings=ModelSettings(tool_choice="auto", include_usage=True),
-            tool_use_behavior=StopAtTools(stop_at_tool_names=["finish"]),
+            # finish() terminates the run only through this gate: it refuses unless a
+            # clean verify() has set self._verified (see _finish_gate). Replaces the
+            # old StopAtTools(["finish"]), which stopped unconditionally on the call.
+            tool_use_behavior=self._finish_gate,
             hooks=orchestrator_hooks,
             tools=[
                 function_tool(self.set_status),
@@ -168,6 +223,8 @@ class OrchestratorAgent:
                 function_tool(self.load_skill),
                 function_tool(self.list_skill_resources),
                 function_tool(self.read_skill_reference),
+                function_tool(make_read_tool(self._fs_ctx)),
+                function_tool(make_list_tool(self._fs_ctx)),
                 function_tool(self.spawn_subagent),
                 function_tool(self.list_subagents),
                 function_tool(self.invoke_subagent),
@@ -175,6 +232,7 @@ class OrchestratorAgent:
                 function_tool(self.wait_for_first_subagent_result),
                 function_tool(self.delete_subagent),
                 function_tool(self.delete_all),
+                function_tool(self.verify),
                 function_tool(self.finish),
             ],
         )
@@ -201,6 +259,7 @@ class OrchestratorAgent:
         Emits events on `self._bus`; attaching a live display is the caller's job
         (see cli.py). The orchestrator no longer knows about any display.
         """
+        self._verified = False  # each task must earn its own clean verify() before finish
         start = time.perf_counter()
         result = await Runner.run(
             self._agent,
@@ -222,6 +281,7 @@ class OrchestratorAgent:
         and receives tool results. The final summary arrives as a tool_call
         chunk with tool_name="finish".
         """
+        self._verified = False  # each task must earn its own clean verify() before finish
         start = time.perf_counter()
         streaming = Runner.run_streamed(
             self._agent,
@@ -414,7 +474,9 @@ class OrchestratorAgent:
                 skill_sections.append(f"### {skill_name} (files at {skill.path.resolve()})\n{body}")
             objective = objective + "\n\n## Skills\n" + "\n\n".join(skill_sections)
 
-        entry = await self._pool.create(agent_name, objective, extra_tools=extra_tools)
+        entry = await self._pool.create(
+            agent_name, objective, extra_tools=extra_tools, skills=tuple(skills or ())
+        )
         self._bus.publish(
             ev.SubagentSpawned(id=entry.id, name=entry.name, skills=tuple(skills or ()))
         )
@@ -433,15 +495,49 @@ class OrchestratorAgent:
         """Terminate all subagent sessions."""
         await self._pool.delete_all()
 
-    async def invoke_subagent(self, agent_id: str, message: str) -> str:
+    async def invoke_subagent(
+        self,
+        agent_id: str,
+        task: str,
+        inputs: list[str] | None = None,
+        acceptance: list[Criterion] | None = None,
+    ) -> str:
         """Start a task on a subagent and return immediately (non-blocking).
-        Use wait_for_subagent_result or wait_for_first_subagent_result to get the result."""
+
+        Arguments:
+            agent_id: the subagent to task (from spawn_subagent).
+            task: what to do — write it as relentless, self-sufficient instructions.
+            inputs: paths/artifacts the subagent should read.
+            acceptance: acceptance criteria (the definition-of-done) you will verify the
+                result against; tag each with check_mode "mechanical" or "judgment".
+                Criteria declared by the subagent's equipped skills are merged in
+                automatically, so only add task-specific ones here.
+
+        Use wait_for_subagent_result or wait_for_first_subagent_result to get the result.
+        """
         entry = self._pool.get(agent_id)
         if entry is None:
             return f"Subagent '{agent_id}' not found. Use spawn_subagent first."
         if entry.run_task is not None and not entry.run_task.done():
             return f"Subagent '{agent_id}' is still running. Use wait_for_subagent_result to await its result."
-        await entry.run(message)
+        # Fold in each equipped skill's declared baseline acceptance criteria (raw
+        # dicts → Criterion), overlaid by the orchestrator's task-specific ones (later
+        # wins by id). Done here deterministically — the "两者叠加" rule — rather than
+        # trusting the model to copy a skill's criteria into every call.
+        skill_criteria: list[Criterion] = []
+        for skill_name in entry.skills:
+            try:
+                skill_criteria.extend(
+                    Criterion(**c) for c in self._skills.load_acceptance(skill_name)
+                )
+            except SkillError:
+                continue
+        request = SubagentRequest(
+            task=task,
+            inputs=inputs or [],
+            acceptance=merge_acceptance(skill_criteria, acceptance or []),
+        )
+        await entry.run(request.render())
         return f"Subagent '{agent_id}' task started."
 
     async def wait_for_subagent_result(self, agent_id: str) -> str:
@@ -453,7 +549,10 @@ class OrchestratorAgent:
             return f"Subagent '{agent_id}' has no active task."
         result = await entry.run_task
         entry.run_task = None
-        return result.final_output or ""
+        # The worker appends a fenced json report to its final message (the backend
+        # rejects structured output_type); recover it into a clean status + manifest +
+        # summary. A worker that ignored the format degrades to summary-only, never an error.
+        return SubagentResponse.parse(result.final_output or "").render()
 
     async def wait_for_first_subagent_result(self) -> str:
         """Block until any running subagent finishes and return its ID and result."""
@@ -469,14 +568,56 @@ class OrchestratorAgent:
         result = await self.wait_for_subagent_result(entry.id)
         return f"Subagent '{entry.id}' ({entry.name}) completed: {result}"
 
+    def verify(self, verification: list[CriterionVerdict]) -> str:
+        """Record your verification of the acceptance criteria — the gate finish()
+        must pass. Provide one verdict (pass/fail + the evidence you observed) per
+        acceptance criterion you set on the task. Call this only after you have
+        actually checked ground truth (mechanical criteria via list_dir/read_file,
+        judgment criteria via an independent verifier subagent).
+
+        Arguments:
+            verification: one CriterionVerdict per acceptance criterion.
+        """
+        if not verification:
+            self._verified = False
+            return "No verdicts given. Provide a pass/fail verdict for every acceptance criterion."
+        failed = [v for v in verification if v.verdict == "fail"]
+        if failed:
+            self._verified = False
+            lines = "\n".join(f"- {v.criterion_id}: {v.evidence}" for v in failed)
+            return (
+                f"{len(failed)} criterion(s) still failing — fix them (re-delegate) and "
+                f"re-verify before finishing:\n{lines}"
+            )
+        self._verified = True
+        return f"All {len(verification)} criteria verified. You may call finish now."
+
     def finish(self, summary: str) -> str:
         """Signal completion with a concise summary of what was accomplished,
         including key outputs, file paths, or results produced.
-        Call this only after collecting all results you need from subagents.
+
+        Gated: this only ends the run after a clean verify(). If called before the
+        acceptance criteria have been verified, it is refused and you must run the
+        verification loop first.
 
         Arguments:
             summary: A concise summary of what was accomplished.
         """
+        if not self._verified:
+            return (
+                "finish refused: no clean verification on record. Run the verification "
+                "loop and call verify() with every acceptance criterion passing first."
+            )
         self.status = summary
         self._bus.publish(ev.OrchestratorStatus(status=summary))
         return summary
+
+    async def _finish_gate(self, _ctx: Any, results: list[Any]) -> ToolsToFinalOutputResult:
+        """Custom tool_use_behavior (replaces StopAtTools): end the run only when
+        finish() is called *and* a clean verify() has set self._verified. On an
+        unverified finish, keep running — finish() itself returned the refusal message,
+        which the model receives and acts on, so it must verify before it can stop."""
+        for r in results:
+            if getattr(r.tool, "name", None) == "finish" and self._verified:
+                return ToolsToFinalOutputResult(is_final_output=True, final_output=r.output)
+        return ToolsToFinalOutputResult(is_final_output=False)

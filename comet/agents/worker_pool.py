@@ -15,11 +15,14 @@ class WorkerAgentPool:
         model: OpenAIChatCompletionsModel,
         bus: MessageBus | None = None,
         session_workspace: Path | None = None,
+        stream_subagents: bool = False,
     ) -> None:
         self._model = model
         self._bus = bus or MessageBus()
         # Shared workspace handed to every worker in this session (see WorkerAgent).
         self._session_workspace = session_workspace
+        # Whether workers stream their tokens as SubagentOutput events (display only).
+        self._stream_subagents = stream_subagents
         self._entries: dict[str, WorkerAgent] = {}
 
     async def create(
@@ -27,6 +30,7 @@ class WorkerAgentPool:
         agent_name: str,
         objective: str,
         extra_tools: list[Tool] | None = None,
+        skills: tuple[str, ...] = (),
     ) -> WorkerAgent:
         """Spawn a new WorkerAgent backed by local subprocess execution."""
         agent_id = "sub_" + str(uuid.uuid4()).replace("-", "")
@@ -38,6 +42,8 @@ class WorkerAgentPool:
             workspace_dir=self._session_workspace,
             extra_tools=extra_tools,
             bus=self._bus,
+            skills=skills,
+            stream_output=self._stream_subagents,
         )
         self._entries[agent_id] = worker
         return worker
