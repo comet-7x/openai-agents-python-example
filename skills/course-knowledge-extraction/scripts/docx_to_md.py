@@ -51,7 +51,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 # --------------------------------------------------------------------------- #
 # Shared post-processing
 # --------------------------------------------------------------------------- #
@@ -71,7 +70,7 @@ def postprocess(md_text, keep_images=False):
             continue
         out.append(line.rstrip())
     text = "\n".join(out)
-    text = BLANK_RUN_RE.sub("\n\n", text)          # collapse 3+ blank lines -> 1 blank
+    text = BLANK_RUN_RE.sub("\n\n", text)  # collapse 3+ blank lines -> 1 blank
     return text.strip("\n") + "\n"
 
 
@@ -100,6 +99,7 @@ def summarize(md_text):
 # --------------------------------------------------------------------------- #
 # Engine 1: pandoc
 # --------------------------------------------------------------------------- #
+
 
 def convert_with_pandoc(input_path):
     """Return Markdown via pandoc, or None if pandoc isn't on PATH."""
@@ -148,6 +148,7 @@ def pandoc_meta_title(input_path):
 # --------------------------------------------------------------------------- #
 # Engine 2: python-docx fallback (in-order body walk)
 # --------------------------------------------------------------------------- #
+
 
 def _runs_to_md(paragraph):
     """Render a paragraph's runs to inline Markdown, wrapping bold spans in
@@ -255,6 +256,7 @@ def convert_with_python_docx(input_path):
 # Driver
 # --------------------------------------------------------------------------- #
 
+
 def convert(input_path, engine="auto", keep_images=False, title=None):
     input_path = Path(input_path)
     if not input_path.exists():
@@ -284,8 +286,7 @@ def convert(input_path, engine="auto", keep_images=False, title=None):
 
     if md is None:
         raise RuntimeError(
-            "No conversion engine available: install pandoc (preferred) or the "
-            "python-docx package."
+            "No conversion engine available: install pandoc (preferred) or the python-docx package."
         )
 
     md = postprocess(md, keep_images=keep_images)

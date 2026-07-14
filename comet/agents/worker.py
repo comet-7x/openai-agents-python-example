@@ -215,9 +215,7 @@ class WorkerAgent:
         deltas never stalls the orchestrator's own stream. Without the flag, the
         cheaper non-streamed `Runner.run` is used."""
         if not self.stream_output:
-            return await Runner.run(
-                self.agent, prompt, max_turns=200, session=self.conv_session
-            )
+            return await Runner.run(self.agent, prompt, max_turns=200, session=self.conv_session)
         streaming = Runner.run_streamed(
             self.agent, prompt, max_turns=200, session=self.conv_session
         )

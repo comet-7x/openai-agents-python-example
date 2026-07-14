@@ -57,8 +57,7 @@ class SubagentRequest(BaseModel):
         if self.acceptance:
             lines = [f"- ({c.check_mode}) {c.describe}" for c in self.acceptance]
             parts.append(
-                "## Acceptance criteria (your work is judged against these)\n"
-                + "\n".join(lines)
+                "## Acceptance criteria (your work is judged against these)\n" + "\n".join(lines)
             )
         return "\n\n".join(parts)
 
@@ -118,9 +117,7 @@ class CriterionVerdict(BaseModel):
     evidence: str = ""
 
 
-def merge_acceptance(
-    base: list[Criterion], extra: list[Criterion]
-) -> list[Criterion]:
+def merge_acceptance(base: list[Criterion], extra: list[Criterion]) -> list[Criterion]:
     """Overlay `extra` onto `base`, deduplicating by `id` (later wins). Used to
     combine a skill's declared baseline criteria with the orchestrator's
     task-specific ones — the "两者叠加" rule — deterministically, without relying on
