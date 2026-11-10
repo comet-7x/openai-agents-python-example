@@ -11,9 +11,8 @@ import time
 if os.path.basename(sys.path[0] or "") == "comet":
     sys.path[0] = os.path.dirname(sys.path[0])
 
-import httpx
 from agents import set_tracing_disabled
-from openai import AsyncOpenAI
+from openai import APIConnectionError, AsyncOpenAI
 from rich.console import Console, Group, RenderableType
 from rich.live import Live
 from rich.panel import Panel
@@ -576,7 +575,7 @@ async def _run_stream(
     before = _usage_snapshot(view)
     start = time.perf_counter()
     # A single turn must never kill the REPL: capture any failure from the stream
-    # (e.g. an httpx.ReadTimeout when the model connection stalls mid-response) and
+    # (e.g. an openai.APITimeoutError when the model connection stalls mid-response) and
     # report it after the live display tears down, so the session stays alive and
     # the user can retry. Errors are printed outside the `with` to avoid interleaving
     # with Rich's Live rendering.
@@ -694,7 +693,9 @@ def _print_turn_error(error: Exception) -> None:
     past LLM_REQUEST_TIMEOUT) get a targeted hint; anything else is surfaced with
     its type and message so real bugs stay visible."""
     console = Console()
-    if isinstance(error, (httpx.HTTPError, TimeoutError)):
+    # openai v3: APITimeoutError subclasses APIConnectionError; TimeoutError is a
+    # catch-all for non-SDK timeouts.
+    if isinstance(error, (APIConnectionError, TimeoutError)):
         console.print(
             Text(
                 f"⚠  Turn interrupted: {type(error).__name__} — the model connection "

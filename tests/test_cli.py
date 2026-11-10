@@ -4,11 +4,12 @@ Offline: a fake orchestrator raises mid-stream instead of calling an LLM."""
 
 from __future__ import annotations
 
-import httpx
+import httpx2
 from comet import cli
 from comet.agents.stream import StreamChunk
 from comet.display.display import format_clock, format_duration
 from comet.display.view import SystemView
+from openai import APITimeoutError
 
 
 def test_format_duration_rolls_over() -> None:
@@ -49,7 +50,7 @@ def test_session_flag_default_convention() -> None:
 
 class _RaisingOrchestrator:
     """Stands in for OrchestratorAgent: streams a chunk, then fails like a stalled
-    backend (the real crash was an httpx.ReadTimeout from run_streamed)."""
+    backend (the real crash was an openai.APITimeoutError from run_streamed)."""
 
     def __init__(self, error: Exception) -> None:
         self._error = error
@@ -77,8 +78,9 @@ def test_finish_tool_settles_on_completed() -> None:
 
 
 async def test_run_stream_survives_midstream_timeout() -> None:
-    # A ReadTimeout mid-stream must be swallowed so the REPL loop keeps going.
-    orch = _RaisingOrchestrator(httpx.ReadTimeout("backend went silent"))
+    # An APITimeoutError mid-stream must be swallowed so the REPL loop keeps going.
+    request = httpx2.Request("POST", "http://test/v1/chat/completions")
+    orch = _RaisingOrchestrator(APITimeoutError(request=request))
     await cli._run_stream(orch, "extract this syllabus", SystemView())  # type: ignore[arg-type]
 
 
