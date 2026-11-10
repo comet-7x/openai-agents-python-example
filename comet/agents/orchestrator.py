@@ -43,8 +43,14 @@ from comet.agents.worker_pool import WorkerAgentPool
 from comet.message_bus import events as ev
 from comet.message_bus.bus import MessageBus
 from comet.skills.registry import SkillError, SkillsRegistry
+from comet.tools.bash import make_shell_tool
 from comet.tools.context import ToolContext
-from comet.tools.filesystem import make_list_tool, make_read_tool
+from comet.tools.filesystem import (
+    make_edit_tool,
+    make_list_tool,
+    make_read_tool,
+    make_write_tool,
+)
 
 ORCHESTRATOR_INSTRUCTIONS = """
 You are a relentless execution agent. Your only job is to get the user's task fully done - not \
@@ -55,16 +61,35 @@ Today is: {time}
 
 ## Default assumptions
 - The user wants working code. Write it, run it, fix it until it works.
-- Subagents have access to a local shell. Installing dependencies, cloning repos, \
-downloading data - this is all expected work, not a blocker. Just do it.
+- YOU have a local shell and file tools (write_file / edit_file / read_file), confined to \
+the session workspace - so do you. Installing dependencies, cloning repos, downloading data, \
+running scripts - this is all expected work, not a blocker. Just do it. Subagents have the \
+same tools.
 - If something is unclear, make a reasonable assumption, proceed, and note the assumption in your \
 finish() summary.
 - Creativity and persistence are the job. If one approach fails, try another. Adapt.
 
+## Do it yourself vs. delegate (default: yourself)
+You are not a pure coordinator. Default to doing the work YOURSELF, inline, with your own \
+shell / write_file / edit_file. In particular, do the sequential SPINE of a task yourself: \
+the outline, the narrative/structure/style, and the final REDUCE - assembling subagents' \
+outputs into the finished deliverable. Keeping the spine in your own context reuses your warm \
+context and keeps the deliverable coherent; spawning a subagent for it instead pays a cold \
+start (re-priming its whole prompt) and a lossy summary hand-off every time.
+
+Only spawn_subagent when at least ONE of these clearly holds:
+1. PARALLELISM - independent sub-parts that can genuinely run at the same time.
+2. ISOLATION - a sub-part produces a lot of verbose intermediate output (reads many files, \
+long tool transcripts) and you only need its small final result, not the mess in your context.
+3. SKILL - a sub-part needs a skill's full body loaded that you don't want to carry inline.
+If none hold - the work is small, sequential, and overlaps the context you already have - just \
+do it yourself. Don't split into two agents what one context can finish.
+
 ## Subagent instructions
-Write your subagent objectives and task messages with the same mindset: assume the work is expected, \
-assume setup is needed, and instruct them to persist. Never let a subagent stop just because something \
-wasn't pre-installed or pre-configured. Subagents should be told to figure it out.
+When you do delegate, write your subagent objectives and task messages with the same mindset: \
+assume the work is expected, assume setup is needed, and instruct them to persist. Never let a \
+subagent stop just because something wasn't pre-installed or pre-configured. Subagents should be \
+told to figure it out.
 
 ## Status updates
 Before every tool call, call set_status with a one-sentence description of what you are about to do, \
@@ -97,7 +122,10 @@ YOU gathered, not by the worker's self-report. Before finishing:
 2. For each JUDGMENT criterion: spawn a NEW, independent verifier subagent. Give it
    only the acceptance criteria and the artifact paths - NOT the producer's summary or
    reasoning (that would just anchor it). Have it judge the artifacts against the
-   criteria and report pass/fail with specific defects.
+   criteria and report pass/fail with specific defects. This holds even for work YOU
+   produced inline - never self-judge a judgment criterion; use an independent verifier.
+   (Mechanical criteria you always check directly with list_dir/read_file, whoever
+   produced the artifact.)
 3. Keep verification proportional: sample and spot-check, never redo the work.
 4. Call verify(...) with a verdict for every criterion. If any fails, fix it (re-delegate)
    and re-verify - do not finish. Only once every criterion passes may you call finish;
@@ -183,11 +211,18 @@ class OrchestratorAgent:
         )
         self._skills = SkillsRegistry(config.SKILLS_DIR)
 
-        # Read-only view of the shared session workspace, so the orchestrator can
-        # verify mechanical acceptance criteria against ground truth itself (list_dir /
-        # read_file) instead of spawning a subagent just to `stat` a file. Confined to
-        # the workspace by filesystem._resolve, exactly like the worker file tools.
-        self._fs_ctx = ToolContext(workspace_dir=self.session_workspace)
+        # View of the shared session workspace, so the orchestrator can (a) verify
+        # mechanical acceptance criteria against ground truth itself (list_dir /
+        # read_file) and (b) do the sequential *spine* of a task inline — write/edit
+        # deliverables and run a confined shell — instead of spawning a subagent for
+        # small, sequential, context-overlapping work. Confined to the workspace by
+        # filesystem._resolve (reads+writes) and bash.check_workspace_escape (shell
+        # writes), exactly like the worker tools. on_command surfaces each shell
+        # command to the live display as a status line.
+        self._fs_ctx = ToolContext(
+            workspace_dir=self.session_workspace,
+            on_command=lambda cmd: self._bus.publish(ev.OrchestratorStatus(status=f"$ {cmd}")),
+        )
 
         # Finish gate: set True only by a clean verify() call, reset at the start of
         # every run. The callable tool_use_behavior (_finish_gate) refuses to let
@@ -225,6 +260,12 @@ class OrchestratorAgent:
                 function_tool(self.read_skill_reference),
                 function_tool(make_read_tool(self._fs_ctx)),
                 function_tool(make_list_tool(self._fs_ctx)),
+                # Inline execution for the spine + reduce (default over delegating; see
+                # the prompt's "Do it yourself vs. delegate" rule). Workspace-confined,
+                # same tools the workers use.
+                function_tool(make_write_tool(self._fs_ctx)),
+                function_tool(make_edit_tool(self._fs_ctx)),
+                function_tool(make_shell_tool(self._fs_ctx)),
                 function_tool(self.spawn_subagent),
                 function_tool(self.list_subagents),
                 function_tool(self.invoke_subagent),

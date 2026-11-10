@@ -25,6 +25,7 @@ from comet.message_bus import events as ev
 from comet.message_bus.bus import MessageBus
 from comet.message_bus.sinks.jsonl_logger import JsonlLogger
 from comet.skills.registry import SkillsRegistry
+from comet.tools.filesystem import make_write_tool
 from openai.types.responses import (
     ResponseReasoningSummaryTextDeltaEvent,
     ResponseReasoningTextDeltaEvent,
@@ -333,13 +334,30 @@ def test_malformed_acceptance_skill_is_skipped(tmp_path) -> None:
     assert reg.load_acceptance("good") == [{"id": "a", "describe": "x"}]
 
 
-async def test_orchestrator_has_readonly_workspace_tools(model, monkeypatch, tmp_path) -> None:
-    # The orchestrator can inspect the shared workspace itself (mechanical
-    # verification) — read_file + list_dir are wired in, plus the verify gate tool.
+async def test_orchestrator_has_workspace_execution_tools(model, monkeypatch, tmp_path) -> None:
+    # The orchestrator does the spine inline (not a pure coordinator): read_file +
+    # list_dir for mechanical verification, plus write_file/edit_file/shell for
+    # producing & assembling deliverables, plus the verify gate tool.
     monkeypatch.setattr(config, "WORKSPACES_ROOT", tmp_path)
     orch = OrchestratorAgent(model=model)
     names = {t.name for t in orch._agent.tools}
-    assert {"read_file", "list_dir", "verify"} <= names
+    assert {"read_file", "list_dir", "write_file", "edit_file", "shell", "verify"} <= names
+    orch._session.close()
+
+
+async def test_orchestrator_file_tools_are_workspace_confined(model, monkeypatch, tmp_path) -> None:
+    # The orchestrator's write/edit tools are the same hard-confined filesystem tools
+    # the workers use: a path escaping the session workspace is rejected, and a write
+    # inside it lands in the shared workspace dir.
+    monkeypatch.setattr(config, "WORKSPACES_ROOT", tmp_path)
+    orch = OrchestratorAgent(model=model)
+    write_file = make_write_tool(orch._fs_ctx)
+
+    assert "escapes the workspace" in await write_file("../escape.txt", "x")
+
+    ok = await write_file("deliverable.md", "hello")
+    assert "Wrote" in ok
+    assert (orch.session_workspace / "deliverable.md").read_text() == "hello"
     orch._session.close()
 
 
