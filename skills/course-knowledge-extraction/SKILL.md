@@ -27,6 +27,7 @@ Turns raw, text-based course material (teaching syllabi, notes, transcripts, art
 - If the user pasted text directly, use that.
 - **Input scope & DOCX intake:** the extraction workflow operates on **text/Markdown**. Everything downstream (type detection, section mining, knowledge-point extraction) reads Markdown, so any non-text source is converted to Markdown *first*, as an explicit step — then the rest of the workflow is identical regardless of the original format.
   - **DOCX** (the common case for a 教学大纲): convert it with the bundled **`scripts/docx_to_md.py`** — **don't hand-roll docx parsing or eyeball the binary**:
+
     ```bash
     # Produces a faithful, structure-preserving Markdown transcription.
     # Pass --title with the course name so a Word Title-styled heading isn't lost.
@@ -387,7 +388,9 @@ absent or stale, so Mode 2 reads **only Output 3**. Because the corrected conten
 ```
 
 **`scripts/parse_knowledge.py`** parses a deep-dive (`.docx` — converted internally — or a
-pre-converted `.md`) into structured JSON: `course` (title, 概况, 总学时, 课程目标) plus one
+pre-converted `.md`) into structured JSON with **English keys only** (no redundant fields):
+`course` = `overview` + `profile` (`course_name`, `english_name`, `college`, `major`,
+`audience`, `total_hours`) + `objectives_intro` + `objectives`, plus one
 object per point (`id`, `knowledge_domain`, `point_type`, `importance`/`difficulty` as 1–5,
 `supports_objectives`, `definition`, `learning_significance`, `detailed_explanation`,
 `examples`, `key_points_and_difficulties`, `prerequisites`/`successors`/`related`).

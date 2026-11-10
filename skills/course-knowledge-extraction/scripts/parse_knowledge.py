@@ -5,15 +5,18 @@ structured records — the ingestion engine for lesson-plan (教案) generation.
 The teacher-corrected deliverables exist only as ``.docx``, and the machine-readable
 knowledge base (Output 2) is absent, so this script treats **Output 3 as the sole
 source of truth**. Give it a ``.docx`` (converted to Markdown via ``docx_to_md.py``
-first) or an already-converted ``.md``; it emits one JSON document::
+first) or an already-converted ``.md``; it emits one JSON document with **English keys
+only** and no redundant fields (the course name / English name / total hours live once,
+inside ``profile``)::
 
     {
-      "course":  {title, title_en, overview, profile{...}, total_hours,
+      "course":  {overview,
+                  profile{course_name, english_name, college, major, audience, total_hours},
                   objectives_intro, objectives[{seq, text, supports}]},
       "points":  [{id, name, knowledge_domain, point_type, importance, difficulty,
                    supports_objectives[int], definition, learning_significance,
                    detailed_explanation, examples, key_points_and_difficulties,
-                   prerequisites[id], successors[id], related[id], relations{raw}}]
+                   prerequisites[id], successors[id], related[id]}]
     }
 
 Every per-point prose field is optional (a point may carry only 定义 + 详细讲解), so a
@@ -47,6 +50,20 @@ HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
 FIELD_RE = re.compile(r"^\*\*\s*(.+?)\s*\*\*\s*$")
 KID_RE = re.compile(r"K\d+")
 STAR = "★"
+
+# 课程概况 table rows use Chinese labels; map them to the fixed English profile keys.
+# The profile is a fixed-shape object of exactly these fields (in this order); any
+# unrecognised row is dropped so no stray/duplicate keys leak into the JSON.
+PROFILE_FIELDS = ("course_name", "english_name", "college", "major", "audience", "total_hours")
+PROFILE_KEY_MAP = {
+    "课程名称": "course_name",
+    "英文名称": "english_name",
+    "开课学院": "college",
+    "开设学院": "college",  # synonym variant seen in some syllabi
+    "适用专业": "major",
+    "授课对象": "audience",
+    "总学时": "total_hours",
+}
 
 # the controlled vocabularies from SKILL.md (used only by --lint to flag drift)
 VALID_DOMAINS = {
@@ -167,8 +184,20 @@ def split_title(text: str) -> tuple[str, str]:
 
 
 def parse_course_profile(block: list[str]) -> tuple[str, dict[str, str]]:
+    """Return (overview, profile) with profile keyed by the fixed English schema names.
+
+    The source 课程概况 table uses Chinese labels; translate them via PROFILE_KEY_MAP
+    into a fixed-shape object of PROFILE_FIELDS (each defaulting to ``""``), dropping any
+    unrecognised row so the profile stays clean and duplicate-free.
+    """
     overview = _paragraph_before_table(block)
-    profile = {r[0]: r[1] for r in _table_rows(block) if len(r) >= 2}
+    profile = dict.fromkeys(PROFILE_FIELDS, "")
+    for r in _table_rows(block):
+        if len(r) < 2:
+            continue
+        key = PROFILE_KEY_MAP.get(r[0].strip())
+        if key:
+            profile[key] = r[1]
     return overview, profile
 
 
@@ -300,14 +329,14 @@ def _collect_until_heading(lines: list[str], start: int) -> tuple[list[str], int
 def parse_markdown(md_text: str) -> dict:
     lines = md_text.splitlines()
     course: dict = {
-        "title": "",
-        "title_en": "",
         "overview": "",
-        "profile": {},
-        "total_hours": None,
+        "profile": dict.fromkeys(PROFILE_FIELDS, ""),
         "objectives_intro": "",
         "objectives": [],
     }
+    # H1 title is captured only as a fallback for the profile name fields (below),
+    # not stored on its own — course_name/english_name are the single source of truth.
+    title_zh = title_en = ""
     points: list[KnowledgePoint] = []
     current_domain = ""
     i, n = 0, len(lines)
@@ -323,11 +352,10 @@ def parse_markdown(md_text: str) -> dict:
             points.append(parse_point(kp.group(1), kp.group(2).strip(), current_domain, block))
             continue
         if level == 1:
-            course["title"], course["title_en"] = split_title(text)
+            title_zh, title_en = split_title(text)
         elif text.startswith("课程概况"):
             block, i = _collect_until_heading(lines, i + 1)
             course["overview"], course["profile"] = parse_course_profile(block)
-            course["total_hours"] = course["profile"].get("总学时")
             continue
         elif text.startswith("课程目标"):
             block, i = _collect_until_heading(lines, i + 1)
@@ -336,6 +364,12 @@ def parse_markdown(md_text: str) -> dict:
         elif text.startswith("知识域"):
             current_domain = text.split("：", 1)[1].strip() if "：" in text else text
         i += 1
+    # Fall back to the H1 title when the 课程概况 table omits the name fields, so
+    # dropping the old top-level title/title_en is lossless.
+    if not course["profile"]["course_name"]:
+        course["profile"]["course_name"] = title_zh
+    if not course["profile"]["english_name"]:
+        course["profile"]["english_name"] = title_en
     _resolve_relation_names(points)
     return {"course": course, "points": [asdict(p) for p in points]}
 
@@ -466,7 +500,7 @@ def run_lint(inputs: list[Path], engine: str) -> int:
     total_err = total_warn = 0
     for d in docs:
         data = load(d, engine=engine)
-        title = data["course"]["title"] or d.stem
+        title = data["course"]["profile"]["course_name"] or d.stem
         findings = lint_document(data)
         errs = sum(1 for f in findings if f[0] == "ERROR")
         warns = sum(1 for f in findings if f[0] == "WARN")
